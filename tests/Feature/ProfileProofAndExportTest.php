@@ -94,6 +94,7 @@ class ProfileProofAndExportTest extends TestCase
         ]);
 
         Storage::fake('public');
+        Storage::fake('proofs');
 
         $file = UploadedFile::fake()->image('proof.jpg', 600, 600);
 
@@ -139,7 +140,7 @@ class ProfileProofAndExportTest extends TestCase
             'order_status' => 'completed',
         ]);
 
-        $response = $this->get('/api/reports/export?type=csv&start_date=' . now()->subDay()->toDateString() . '&end_date=' . now()->toDateString());
+        $response = $this->get('/api/reports/export?type=csv&start_date=' . now('Asia/Jakarta')->subDay()->toDateString() . '&end_date=' . now('Asia/Jakarta')->toDateString());
 
         $response->assertOk();
         $this->assertStringContainsString('invoice_number', $response->content());

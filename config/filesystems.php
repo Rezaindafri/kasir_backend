@@ -30,6 +30,15 @@ return [
 
     'disks' => [
 
+        // Never linked to public/storage and no temporary public URL route.
+        'proofs' => [
+            'driver' => 'local',
+            'root' => storage_path('app/private'),
+            'visibility' => 'private',
+            'serve' => false,
+            'throw' => true,
+        ],
+
         'local' => [
             'driver' => 'local',
             'root' => storage_path('app/private'),

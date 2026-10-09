@@ -10,6 +10,7 @@ use App\Models\TransactionPayment;
 use App\Models\User;
 use App\Services\TransactionStatusService;
 use App\Services\OwnerScopeService;
+use App\Services\BusinessTime;
 use Illuminate\Http\Request;
 
 class DashboardController extends Controller
@@ -34,7 +35,7 @@ class DashboardController extends Controller
         // Sinkronisasi seluruh owner tetap dijalankan scheduler.
         $this->statusService->synchronize($ownerId);
         $now = now();
-        $startOfDay = $now->copy()->startOfDay();
+        $startOfDay = BusinessTime::startOfDay($now);
         $period = $validated['period'] ?? 'month';
         [$rangeStart, $rangeEnd] = $this->dashboardPeriodRange($period, $validated, $now);
 
@@ -215,7 +216,7 @@ class DashboardController extends Controller
         $ownerId = $this->ownerScope->idFor($request->user());
         $this->statusService->synchronize($ownerId);
         $now = now();
-        $todayStart = $now->copy()->startOfDay();
+        $todayStart = BusinessTime::startOfDay($now);
 
         $todayTransactions = Transaction::with(['customer', 'transactionDetails.service'])
             ->where('owner_id', $ownerId)
@@ -339,11 +340,11 @@ class DashboardController extends Controller
             'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
             'cashier_id' => ['nullable', 'integer'],
         ]);
-        $start = $validated['start_date'] ?? now()->subDays(30)->toDateString();
-        $end = $validated['end_date'] ?? now()->toDateString();
+        $start = $validated['start_date'] ?? BusinessTime::now()->subDays(30)->toDateString();
+        $end = $validated['end_date'] ?? BusinessTime::now()->toDateString();
 
-        $startDate = now()->parse($start)->startOfDay();
-        $endDate = now()->parse($end)->endOfDay();
+        $startDate = BusinessTime::startOfDay($start);
+        $endDate = BusinessTime::endOfDay($end);
         $cashierId = $validated['cashier_id'] ?? null;
         if ($cashierId && !$this->isOwnerCashier($ownerId, (int) $cashierId)) {
             abort(422, 'Kasir tidak berada di kelompok owner ini.');
@@ -420,8 +421,8 @@ class DashboardController extends Controller
             'end_date' => ['nullable', 'date', 'after_or_equal:start_date'],
             'cashier_id' => ['nullable', 'integer'],
         ]);
-        $start = now()->parse($validated['start_date'] ?? now()->startOfMonth()->toDateString())->startOfDay();
-        $end = now()->parse($validated['end_date'] ?? now()->toDateString())->endOfDay();
+        $start = BusinessTime::startOfDay($validated['start_date'] ?? BusinessTime::now()->startOfMonth()->toDateString());
+        $end = BusinessTime::endOfDay($validated['end_date'] ?? BusinessTime::now()->toDateString());
         $cashierId = $validated['cashier_id'] ?? null;
         if ($cashierId && !$this->isOwnerCashier($ownerId, (int) $cashierId)) {
             abort(422, 'Kasir tidak berada di kelompok owner ini.');
@@ -448,8 +449,9 @@ class DashboardController extends Controller
             'status' => 'success',
             'data' => [
                 'period' => [
-                    'start_date' => $start->toDateString(),
-                    'end_date' => $end->toDateString(),
+                    'start_date' => BusinessTime::local($start)->toDateString(),
+                    'end_date' => BusinessTime::local($end)->toDateString(),
+                    'timezone' => BusinessTime::TIMEZONE,
                 ],
                 'summary' => [
                     'order_value' => $financial['order_value'],
@@ -511,11 +513,11 @@ class DashboardController extends Controller
             'cashier_id' => ['nullable', 'integer'],
         ]);
         $type = $validated['type'] ?? 'csv';
-        $start = $validated['start_date'] ?? now()->subDays(30)->toDateString();
-        $end = $validated['end_date'] ?? now()->toDateString();
+        $start = $validated['start_date'] ?? BusinessTime::now()->subDays(30)->toDateString();
+        $end = $validated['end_date'] ?? BusinessTime::now()->toDateString();
 
-        $startDate = now()->parse($start)->startOfDay();
-        $endDate = now()->parse($end)->endOfDay();
+        $startDate = BusinessTime::startOfDay($start);
+        $endDate = BusinessTime::endOfDay($end);
         $cashierId = $validated['cashier_id'] ?? null;
         if ($cashierId && !$this->isOwnerCashier($ownerId, (int) $cashierId)) {
             abort(422, 'Kasir tidak berada di kelompok owner ini.');
@@ -536,7 +538,7 @@ class DashboardController extends Controller
             ], 200);
         }
 
-        $columns = ['invoice_number', 'customer_name', 'payment_method', 'payment_amount', 'paid_at', 'source'];
+        $columns = ['invoice_number', 'customer_name', 'payment_method', 'payment_amount', 'paid_at', 'source', 'timezone'];
         $rows = [implode(',', $columns)];
 
         foreach ($payments as $payment) {
@@ -545,20 +547,27 @@ class DashboardController extends Controller
                 $this->csvValue($transaction->invoice_number ?? ''),
                 $this->csvValue($transaction->customer?->name ?? ''),
                 $this->csvValue($payment->payment_method ?? 'cash'),
-                $this->csvValue((string) $payment->amount),
-                $this->csvValue($payment->paid_at?->toDateTimeString() ?? ''),
+                $this->csvValue((string) $payment->amount, false),
+                $this->csvValue($payment->paid_at ? BusinessTime::local($payment->paid_at)->toDateTimeString() : ''),
                 $this->csvValue($payment->source ?? 'payment'),
+                'WIB',
             ]);
         }
 
         return response(implode(PHP_EOL, $rows), 200)
             ->header('Content-Type', 'text/csv; charset=UTF-8')
-            ->header('Content-Disposition', 'attachment; filename="laporan-pendapatan-' . now()->format('Ymd') . '.csv"');
+            ->header('Content-Disposition', 'attachment; filename="laporan-pendapatan-' . BusinessTime::now()->format('Ymd') . '.csv"');
     }
 
-    private function csvValue(string $value): string
+    private function csvValue(string $value, bool $isText = true): string
     {
-        if (str_contains($value, ',') || str_contains($value, '"') || str_contains($value, "\n")) {
+        // CSV quoting is not formula escaping. Only text cells get an
+        // apostrophe; numeric amounts keep their numeric spreadsheet type.
+        if ($isText && preg_match('/^[\x00-\x20]*[=+@-]/', $value)) {
+            $value = "'" . $value;
+        }
+        if (str_contains($value, ',') || str_contains($value, '"') ||
+            str_contains($value, "\n") || str_contains($value, "\r")) {
             return '"' . str_replace('"', '""', $value) . '"';
         }
 
@@ -568,16 +577,18 @@ class DashboardController extends Controller
     /** @return array{0: mixed, 1: mixed} */
     private function dashboardPeriodRange(string $period, array $validated, $now): array
     {
-        return match ($period) {
+        $now = BusinessTime::local($now);
+        [$start, $end] = match ($period) {
             'today' => [$now->copy()->startOfDay(), $now->copy()->endOfDay()],
             'week' => [$now->copy()->subDays(6)->startOfDay(), $now->copy()->endOfDay()],
             'year' => [$now->copy()->startOfYear(), $now->copy()->endOfDay()],
             'custom' => [
-                now()->parse($validated['start_date'] ?? $now->copy()->startOfMonth()->toDateString())->startOfDay(),
-                now()->parse($validated['end_date'] ?? $now->toDateString())->endOfDay(),
+                BusinessTime::startOfDay($validated['start_date'] ?? $now->copy()->startOfMonth()->toDateString()),
+                BusinessTime::endOfDay($validated['end_date'] ?? $now->toDateString()),
             ],
             default => [$now->copy()->startOfMonth(), $now->copy()->endOfDay()],
         };
+        return [BusinessTime::utc($start), BusinessTime::utc($end)];
     }
 
     /**
@@ -594,7 +605,7 @@ class DashboardController extends Controller
         return Expense::query()
             ->with('recorder:id,name,username,role')
             ->where('owner_id', $ownerId)
-            ->whereBetween('occurred_at', [$start, $end])
+            ->whereBetween('occurred_at', [BusinessTime::utc($start), BusinessTime::utc($end)])
             ->orderByDesc('occurred_at')
             ->get();
     }
@@ -661,6 +672,7 @@ class DashboardController extends Controller
             'created_at' => $transaction->created_at?->toIso8601String(),
             'estimated_finish_at' => $transaction->estimated_finish_at?->toIso8601String(),
             'notes' => $transaction->notes,
+            'has_proof_image' => $transaction->has_proof_image,
         ];
     }
 
@@ -689,7 +701,7 @@ class DashboardController extends Controller
         $payments = TransactionPayment::query()
             ->with(['transaction.customer', 'transaction.transactionDetails.service', 'recorder:id,name,username,role'])
             ->where('owner_id', $ownerId)
-            ->when($start && $end, fn ($query) => $query->whereBetween('paid_at', [$start, $end]))
+            ->when($start && $end, fn ($query) => $query->whereBetween('paid_at', [BusinessTime::utc($start), BusinessTime::utc($end)]))
             // Angka pembayaran milik akun yang benar-benar mencatat
             // pembayaran. Ini membuat filter "Me (Owner)" mencakup
             // pelunasan yang dicatat owner untuk pesanan kasir.
@@ -702,7 +714,7 @@ class DashboardController extends Controller
             ->where('owner_id', $ownerId)
             ->where('paid_amount', '>', 0)
             ->whereDoesntHave('payments')
-            ->when($start && $end, fn ($query) => $query->whereBetween('updated_at', [$start, $end]))
+            ->when($start && $end, fn ($query) => $query->whereBetween('updated_at', [BusinessTime::utc($start), BusinessTime::utc($end)]))
             // Data sebelum payment ledger tidak punya recorded_by. Untuk
             // fallback historis, satu-satunya identitas yang tersedia adalah
             // pembuat transaksi.
@@ -773,11 +785,13 @@ class DashboardController extends Controller
     /** @return array<int, array{label: string, value: int}> */
     private function reportPaymentChart(int $ownerId, ?int $cashierId, $end): array
     {
+        $end = BusinessTime::local($end);
         $chart = [];
         for ($offset = 6; $offset >= 0; $offset--) {
             $date = $end->copy()->subDays($offset);
             $chart[] = [
                 'label' => $date->locale('id')->translatedFormat('D'),
+                'date' => $date->toDateString(),
                 'value' => $this->revenueFor(
                     $ownerId,
                     $date->copy()->startOfDay(),
@@ -792,7 +806,9 @@ class DashboardController extends Controller
     /** @return array<int, array{label: string, value: int}> */
     private function ownerChart(int $ownerId, ?int $cashierId, $start, $end): array
     {
-        $days = $start->diffInDays($end) + 1;
+        $start = BusinessTime::local($start);
+        $end = BusinessTime::local($end);
+        $days = (int) $start->copy()->startOfDay()->diffInDays($end->copy()->startOfDay()) + 1;
         $chart = [];
         if ($days <= 31) {
             for ($date = $start->copy(); $date->lte($end); $date->addDay()) {
@@ -800,6 +816,7 @@ class DashboardController extends Controller
                     // Untuk rentang Bulan ini, label hanya tanggal agar
                     // tidak berulang nama hari dan tetap terbaca di HP.
                     'label' => $days > 7 ? $date->format('d') : $date->locale('id')->translatedFormat('D'),
+                    'date' => $date->toDateString(),
                     'value' => $this->revenueFor(
                         $ownerId,
                         $date->copy()->startOfDay(),
@@ -814,10 +831,11 @@ class DashboardController extends Controller
         for ($date = $start->copy()->startOfMonth(); $date->lte($end); $date->addMonth()) {
             $chart[] = [
                 'label' => $date->locale('id')->translatedFormat('MMM'),
+                'date' => $date->format('Y-m'),
                 'value' => $this->revenueFor(
                     $ownerId,
-                    $date->copy()->startOfMonth(),
-                    $date->copy()->endOfMonth(),
+                    $date->copy()->startOfMonth()->max($start),
+                    $date->copy()->endOfMonth()->min($end),
                     $cashierId,
                 ),
             ];

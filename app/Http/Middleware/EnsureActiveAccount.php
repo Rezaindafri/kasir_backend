@@ -5,6 +5,7 @@ namespace App\Http\Middleware;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Laravel\Sanctum\PersonalAccessToken;
 
 class EnsureActiveAccount
 {
@@ -17,14 +18,21 @@ class EnsureActiveAccount
         $user = $authenticatedUser?->fresh();
 
         if (!$user || !$user->is_active) {
-            $authenticatedUser?->currentAccessToken()?->delete();
+            $token = $authenticatedUser?->currentAccessToken();
+            if ($token instanceof PersonalAccessToken) {
+                $token->delete();
+            }
 
             return response()->json([
                 'status' => 'error',
+                'code' => 'account_inactive',
                 'message' => 'Akun dinonaktifkan.',
             ], 403);
         }
 
+        // fresh() refreshes account policy/role, but drops Sanctum's token.
+        // Preserve the validated token so logout and session revocation work.
+        $user->withAccessToken($authenticatedUser->currentAccessToken());
         $request->setUserResolver(fn () => $user);
 
         return $next($request);

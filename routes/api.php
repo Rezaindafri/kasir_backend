@@ -13,9 +13,9 @@ use App\Http\Controllers\Api\UserController;
 use Illuminate\Support\Facades\Route;
 
 Route::prefix('auth')->group(function () {
-    Route::post('/login', [AuthController::class, 'login']);
+    Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:login');
 
-Route::middleware(['auth:sanctum', 'active'])->group(function () {
+    Route::middleware(['auth:sanctum', 'active'])->group(function () {
         Route::post('/logout', [AuthController::class, 'logout']);
         Route::get('/me', [AuthController::class, 'me']);
     });
@@ -87,6 +87,7 @@ Route::middleware(['auth:sanctum', 'active'])->group(function () {
     });
 
     Route::middleware('role:owner,kasir')->group(function () {
+        Route::get('/transactions/{id}/proof', [TransactionController::class, 'downloadProof']);
         Route::post('/transactions/{id}/collection', [TransactionController::class, 'collect']);
         Route::patch('/transactions/{id}/status', [TransactionController::class, 'updateStatus']);
         Route::post('/transactions/{id}/payment', [TransactionController::class, 'markPayment']);

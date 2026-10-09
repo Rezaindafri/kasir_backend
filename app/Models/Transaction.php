@@ -9,6 +9,13 @@ class Transaction extends Model
 {
     use HasFactory;
 
+    protected $appends = ['has_proof_image'];
+
+    public function getHasProofImageAttribute(): bool
+    {
+        return !empty($this->proof_image_path);
+    }
+
     protected $fillable = [
         'customer_id',
         'owner_id',

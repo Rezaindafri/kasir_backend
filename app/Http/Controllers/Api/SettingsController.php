@@ -7,6 +7,7 @@ use App\Models\LaundrySetting;
 use App\Models\User;
 use App\Services\OwnerScopeService;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 
 class SettingsController extends Controller
 {
@@ -60,27 +61,33 @@ class SettingsController extends Controller
         $validated = $request->validate([
             'version' => ['required', 'integer', 'in:2'],
             'type' => ['required', 'in:owner_configuration_backup'],
-            'settings' => ['required', 'array'],
-            'settings.*.owner_id' => ['required', 'integer', 'exists:users,id'],
+            'settings' => ['required', 'array', 'min:1', 'max:1000'],
+            'settings.*.owner_id' => ['required', 'integer', 'distinct', 'exists:users,id'],
             'settings.*.business_name' => ['required', 'string', 'max:255'],
             'settings.*.phone' => ['nullable', 'string', 'max:30'],
             'settings.*.address' => ['nullable', 'string'],
         ]);
 
-        foreach ($validated['settings'] as $item) {
-            if (!User::query()->whereKey($item['owner_id'])->where('role', 'owner')->exists()) {
+        DB::transaction(function () use ($validated): void {
+            $ownerIds = collect($validated['settings'])->pluck('owner_id')->sort()->values();
+            $owners = User::query()->whereIn('id', $ownerIds)->where('role', 'owner')
+                ->orderBy('id')->lockForUpdate()->get();
+            // Validate every account before the first configuration write.
+            if ($owners->count() !== $ownerIds->count()) {
                 abort(422, 'Backup memuat owner yang tidak valid.');
             }
 
-            LaundrySetting::query()->updateOrCreate(
-                ['owner_id' => $item['owner_id']],
-                [
-                    'business_name' => $item['business_name'],
-                    'phone' => $item['phone'] ?? '',
-                    'address' => $item['address'] ?? '',
-                ],
-            );
-        }
+            foreach ($validated['settings'] as $item) {
+                LaundrySetting::query()->updateOrCreate(
+                    ['owner_id' => $item['owner_id']],
+                    [
+                        'business_name' => $item['business_name'],
+                        'phone' => $item['phone'] ?? '',
+                        'address' => $item['address'] ?? '',
+                    ],
+                );
+            }
+        });
 
         return response()->json([
             'status' => 'success',

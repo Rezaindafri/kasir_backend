@@ -209,7 +209,7 @@ class AccountAndFinancialIntegrityTest extends TestCase
             'action' => 'transaction.payment_recorded',
         ]);
 
-        $today = now()->toDateString();
+        $today = now('Asia/Jakarta')->toDateString();
         $this->getJson('/api/reports/revenue?start_date=' . $today . '&end_date=' . $today)
             ->assertOk()
             ->assertJsonPath('data.revenue', 50000)
@@ -261,7 +261,8 @@ class AccountAndFinancialIntegrityTest extends TestCase
         ]);
 
         Sanctum::actingAs($owner, ['*']);
-        $response = $this->getJson('/api/reports/overview?start_date=' . now()->toDateString() . '&end_date=' . now()->toDateString());
+        $today = now('Asia/Jakarta')->toDateString();
+        $response = $this->getJson('/api/reports/overview?start_date=' . $today . '&end_date=' . $today);
 
         $response->assertOk()
             ->assertJsonPath('data.summary.order_value', 100000)
@@ -277,15 +278,15 @@ class AccountAndFinancialIntegrityTest extends TestCase
         // Owner juga boleh menjadi pencatat transaksi/pembayaran miliknya.
         // Filter diri sendiri harus diterima, sedangkan akun owner lain tetap
         // ditolak oleh batas kelompok data.
-        $this->getJson('/api/reports/overview?start_date=' . now()->toDateString()
-            . '&end_date=' . now()->toDateString() . '&cashier_id=' . $owner->id)
+        $this->getJson('/api/reports/overview?start_date=' . $today
+            . '&end_date=' . $today . '&cashier_id=' . $owner->id)
             ->assertOk()
             ->assertJsonPath('data.summary.payments_received', 30000);
         $this->getJson('/api/reports/overview?cashier_id=' . $otherOwner->id)
             ->assertUnprocessable();
 
         $this->getJson('/api/dashboard/owner?period=custom&start_date='
-            . now()->toDateString() . '&end_date=' . now()->toDateString()
+            . $today . '&end_date=' . $today
             . '&cashier_id=' . $owner->id)
             ->assertOk()
             ->assertJsonPath('data.accounts.0.id', $owner->id)

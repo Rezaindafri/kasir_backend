@@ -3,6 +3,20 @@
 .env
 .env.backup
 .env.production
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+http-client.private.env.json
+*.private.env.json
+api_test.local.http
+# A token was found in the already-tracked api_test.http. Ignoring is NOT
+# revocation or history cleanup; see the audit report before publishing.
+/api_test.http
+.http-client/
 .phpactor.json
 .phpunit.result.cache
 /.codex
@@ -21,6 +35,18 @@
 /storage/*.key
 /storage/pail
 /vendor
+/backups/
+/private/
+/database/*.sqlite
+/database/*.sqlite3
+/database/*.sqlite-*
+/database/*.db
+*.sql.gz
+*.sql
+# Laravel schema-only dumps can be reviewed as source; data backups cannot.
+!/database/schema/*.sql
+*.dump
+*.bak
 _ide_helper.php
 Homestead.json
 Homestead.yaml

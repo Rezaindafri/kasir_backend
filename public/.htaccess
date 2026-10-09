@@ -5,6 +5,10 @@
 
     RewriteEngine On
 
+    # Legacy handover proofs must be downloaded through the authenticated API.
+    # This must precede the static-file bypass at the bottom of this file.
+    RewriteRule ^storage/proofs(?:/|$) - [F,L,NC]
+
     # Handle Authorization Header
     RewriteCond %{HTTP:Authorization} .
     RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]

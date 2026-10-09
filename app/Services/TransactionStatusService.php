@@ -28,49 +28,55 @@ class TransactionStatusService
 
     public function synchronizeTransaction(Transaction $transaction): void
     {
-        if (in_array($transaction->laundry_status, ['collected', 'late'], true) ||
-            !$transaction->estimated_finish_at) {
-            return;
-        }
+        DB::transaction(function () use ($transaction): void {
+            // A scheduler/model loaded before collection must not overwrite
+            // the terminal status committed by another request.
+            $current = Transaction::query()->whereKey($transaction->id)->lockForUpdate()->first();
+            if (!$current) return;
+            if (in_array($current->laundry_status, ['collected', 'late'], true) ||
+                !$current->estimated_finish_at) {
+                $transaction->setRawAttributes($current->getAttributes(), true);
+                return;
+            }
 
-        $now = now();
-        $estimatedFinishAt = Carbon::parse($transaction->estimated_finish_at);
-        if ($now->lt($estimatedFinishAt)) {
-            return;
-        }
+            $now = now();
+            $estimatedFinishAt = Carbon::parse($current->estimated_finish_at);
+            if ($now->lt($estimatedFinishAt)) {
+                $transaction->setRawAttributes($current->getAttributes(), true);
+                return;
+            }
+            $createdAt = Carbon::parse($current->created_at);
+            $serviceDurationSeconds = max(0, $estimatedFinishAt->diffInSeconds($createdAt, true));
+            $lateAt = $estimatedFinishAt->copy()->addSeconds($serviceDurationSeconds);
+            $status = $now->gt($lateAt) ? 'late' : 'completed';
 
-        $createdAt = Carbon::parse($transaction->created_at);
-        $serviceDurationSeconds = max(0, $estimatedFinishAt->diffInSeconds($createdAt, true));
-        $lateAt = $estimatedFinishAt->copy()->addSeconds($serviceDurationSeconds);
-        $status = $now->gt($lateAt) ? 'late' : 'completed';
-
-        if ($transaction->laundry_status !== $status) {
-            DB::transaction(function () use ($transaction, $status): void {
-                $before = $transaction->only([
+            if ($current->laundry_status !== $status) {
+                $before = $current->only([
                     'laundry_status',
                     'order_status',
                     'estimated_finish_at',
                 ]);
-                $transaction->update([
+                $current->update([
                     'laundry_status' => $status,
                     'order_status' => $status === 'late' ? 'processing' : 'completed',
                 ]);
                 $this->auditLog->record(
                     null,
-                    $transaction->owner_id,
+                    $current->owner_id,
                     'transaction',
-                    $transaction->id,
+                    $current->id,
                     'transaction.status_synchronized',
                     [
                         'before' => $before,
-                        'after' => $transaction->fresh()->only([
+                        'after' => $current->only([
                             'laundry_status',
                             'order_status',
                             'estimated_finish_at',
                         ]),
                     ],
                 );
-            });
-        }
+            }
+            $transaction->setRawAttributes($current->getAttributes(), true);
+        });
     }
 }

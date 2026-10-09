@@ -5,9 +5,11 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\AuditLog;
 use App\Models\Customer;
+use App\Models\Expense;
 use App\Models\LaundrySetting;
 use App\Models\Service;
 use App\Models\Transaction;
+use App\Models\TransactionPayment;
 use App\Models\User;
 use App\Services\AccountPolicyService;
 use App\Services\AuditLogService;
@@ -18,6 +20,8 @@ use Illuminate\Validation\Rule;
 
 class UserController extends Controller
 {
+    use RespondsToApiFailures;
+
     public function __construct(
         private readonly AuditLogService $auditLog,
         private readonly AccountPolicyService $accountPolicy,
@@ -95,11 +99,8 @@ class UserController extends Controller
 
                 return $user;
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal membuat akun: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal membuat akun. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -199,6 +200,12 @@ class UserController extends Controller
 
         try {
             $fresh = DB::transaction(function () use ($user, $validated, $request): User {
+                $user = User::query()->whereKey($user->id)->lockForUpdate()->firstOrFail();
+                if (!$this->canManage($request, $user)) abort(403, 'Akses ditolak');
+                if ($user->role === 'owner' && ($validated['role'] ?? $user->role) !== 'owner' &&
+                    $this->hasHistoricalResponsibilities($user)) {
+                    abort(422, 'Owner yang memiliki anggota atau data operasional tidak dapat diubah menjadi kasir.');
+                }
                 $before = $this->auditSnapshot($user);
                 $user->update($validated);
                 $fresh = $user->fresh();
@@ -213,11 +220,8 @@ class UserController extends Controller
 
                 return $fresh;
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal memperbarui akun: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal memperbarui akun. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -293,11 +297,8 @@ class UserController extends Controller
 
                 return $fresh;
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal memperbarui kredensial akun: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal memperbarui kredensial akun. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -357,11 +358,8 @@ class UserController extends Controller
                     ['before' => $snapshot],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal menghapus akun: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal menghapus akun. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -423,11 +421,8 @@ class UserController extends Controller
 
                 return $fresh;
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal mengubah status akun: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal mengubah status akun. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -497,12 +492,16 @@ class UserController extends Controller
                 || Customer::where('owner_id', $user->id)->exists()
                 || Service::where('owner_id', $user->id)->exists()
                 || Transaction::where('owner_id', $user->id)->exists()
+                || Expense::where('owner_id', $user->id)->exists()
+                || TransactionPayment::where('owner_id', $user->id)->exists()
                 || LaundrySetting::where('owner_id', $user->id)->exists()
                 || AuditLog::where('owner_id', $user->id)->exists()
                 || AuditLog::where('actor_id', $user->id)->exists();
         }
 
         return Transaction::where('cashier_id', $user->id)->exists()
+            || TransactionPayment::where('recorded_by', $user->id)->exists()
+            || Expense::where('recorded_by', $user->id)->exists()
             || AuditLog::where('actor_id', $user->id)->exists();
     }
 

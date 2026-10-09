@@ -9,6 +9,7 @@ use App\Services\AuditLogService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Laravel\Sanctum\PersonalAccessToken;
 
 class AuthController extends Controller
 {
@@ -23,8 +24,8 @@ class AuthController extends Controller
     {
         // 1. Validasi input dari Flutter
         $request->validate([
-            'username' => 'required|string',
-            'password' => 'required|string',
+            'username' => 'required|string|max:100',
+            'password' => 'required|string|max:1024',
         ]);
 
         // 2. Cari user berdasarkan username
@@ -34,6 +35,7 @@ class AuthController extends Controller
         if (!$user || !Hash::check($request->password, $user->password)) {
             return response()->json([
                 'status' => 'error',
+                'code' => 'invalid_credentials',
                 'message' => 'Username atau password salah',
             ], 401);
         }
@@ -41,12 +43,14 @@ class AuthController extends Controller
         if (!$user->is_active) {
             return response()->json([
                 'status' => 'error',
+                'code' => 'account_inactive',
                 'message' => 'Akun dinonaktifkan',
             ], 403);
         }
 
         // 4. Buat token autentikasi baru menggunakan Sanctum
-        $token = $user->createToken('auth_token')->plainTextToken;
+        $expiresAt = now()->addDays(30);
+        $token = $user->createToken('auth_token', ['*'], $expiresAt)->plainTextToken;
 
         // 5. Kembalikan respons JSON ke Flutter
         return response()->json([
@@ -54,6 +58,7 @@ class AuthController extends Controller
             'message' => 'Login berhasil',
             'data' => [
                 'token' => $token,
+                'expires_at' => $expiresAt->toIso8601String(),
                 'user' => [
                     'id' => $user->id,
                     'name' => $user->name,
@@ -70,7 +75,11 @@ class AuthController extends Controller
     public function logout(Request $request)
     {
         // Hapus token yang sedang digunakan saat logout
-        $request->user()->currentAccessToken()->delete();
+        $token = $request->user()->currentAccessToken();
+        if (!$token instanceof PersonalAccessToken) {
+            abort(401, 'Sesi tidak berlaku.');
+        }
+        $token->delete();
 
         return response()->json([
             'status' => 'success',
@@ -163,7 +172,8 @@ class AuthController extends Controller
             ], 422);
         }
 
-        DB::transaction(function () use ($user, $validated): void {
+        $currentToken = $user->currentAccessToken();
+        DB::transaction(function () use ($user, $validated, $currentToken): void {
             $user->update([
                 'password' => Hash::make($validated['password']),
             ]);
@@ -175,6 +185,12 @@ class AuthController extends Controller
                 $fresh->id,
                 'user.password_changed',
             );
+            // Keep only this already-authenticated session. For a stateful
+            // session without a personal token, revoke every bearer token.
+            $user->tokens()
+                ->when($currentToken instanceof PersonalAccessToken,
+                    fn ($query) => $query->whereKeyNot($currentToken->getKey()))
+                ->delete();
         });
 
         return response()->json([

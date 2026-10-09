@@ -1,14 +1,18 @@
-### 1. Login untuk ambil Token
-POST http://localhost/api-indafri-laundry/public/api/auth/login
+# Local request example. Supply variables from a PRIVATE client environment.
+# Never paste a real password/token into this tracked file.
+# Required variables: baseUrl, username, password, authToken.
+
+### Login
+POST {{baseUrl}}/auth/login
 Content-Type: application/json
 Accept: application/json
 
 {
-  "username": "owner",
-  "password": "owner123"
+  "username": "{{username}}",
+  "password": "{{password}}"
 }
 
-### 2. Tes API Dashboard Owner
-GET http://localhost/api-indafri-laundry/public/api/dashboard/owner
-Authorization: Bearer 47|c7nWCwYQ9cUh3dFS03JqFjyLyIUO52CHk3eeqyk17786c79f
+### Owner dashboard
+GET {{baseUrl}}/dashboard/owner
+Authorization: Bearer {{authToken}}
 Accept: application/json

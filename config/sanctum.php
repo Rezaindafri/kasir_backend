@@ -50,7 +50,8 @@ return [
     |
     */
 
-    'expiration' => null,
+    // Fixed 30-day server limit also covers tokens issued before this policy.
+    'expiration' => 30 * 24 * 60,
 
     /*
     |--------------------------------------------------------------------------

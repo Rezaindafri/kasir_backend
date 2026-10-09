@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Expense;
 use App\Services\AuditLogService;
 use App\Services\OwnerScopeService;
+use App\Services\BusinessTime;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -31,11 +32,11 @@ class ExpenseController extends Controller
             ->where('owner_id', $ownerId)
             ->when(
                 $validated['start_date'] ?? null,
-                fn ($query, $start) => $query->where('occurred_at', '>=', now()->parse($start)->startOfDay()),
+                fn ($query, $start) => $query->where('occurred_at', '>=', BusinessTime::startOfDay($start)),
             )
             ->when(
                 $validated['end_date'] ?? null,
-                fn ($query, $end) => $query->where('occurred_at', '<=', now()->parse($end)->endOfDay()),
+                fn ($query, $end) => $query->where('occurred_at', '<=', BusinessTime::endOfDay($end)),
             )
             ->orderByDesc('occurred_at')
             ->orderByDesc('id')
@@ -146,12 +147,18 @@ class ExpenseController extends Controller
     /** @return array{amount: float, category: string, description: ?string, occurred_at: string} */
     private function validatedPayload(Request $request): array
     {
-        return $request->validate([
+        $validated = $request->validate([
             'amount' => ['required', 'numeric', 'min:1', 'max:9999999999999.99'],
             'category' => ['required', 'string', 'max:80'],
             'description' => ['nullable', 'string', 'max:500'],
             'occurred_at' => ['required', 'date'],
         ]);
+        // An explicit offset is an instant; a legacy timezone-less input is
+        // interpreted as business wall time. Always persist its UTC instant.
+        $validated['occurred_at'] = \Illuminate\Support\Carbon::parse(
+            $validated['occurred_at'], BusinessTime::TIMEZONE,
+        )->utc()->toDateTimeString();
+        return $validated;
     }
 
     /** @return array<string, mixed> */

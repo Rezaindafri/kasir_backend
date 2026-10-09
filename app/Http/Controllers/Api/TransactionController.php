@@ -12,15 +12,21 @@ use App\Models\User;
 use App\Services\OwnerScopeService;
 use App\Services\AuditLogService;
 use App\Services\TransactionStatusService;
+use App\Services\BusinessTime;
+use App\Services\ProofStorage;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
 
 class TransactionController extends Controller
 {
+    use RespondsToApiFailures;
+
     public function __construct(
         private readonly TransactionStatusService $statusService,
         private readonly OwnerScopeService $ownerScope,
         private readonly AuditLogService $auditLog,
+        private readonly ProofStorage $proofStorage,
     )
     {
     }
@@ -93,10 +99,10 @@ class TransactionController extends Controller
         }
 
         if (!empty($validated['from'])) {
-            $query->whereDate('created_at', '>=', $validated['from']);
+            $query->where('created_at', '>=', BusinessTime::startOfDay($validated['from']));
         }
         if (!empty($validated['to'])) {
-            $query->whereDate('created_at', '<=', $validated['to']);
+            $query->where('created_at', '<=', BusinessTime::endOfDay($validated['to']));
         }
 
         if (array_key_exists('collected', $validated)) {
@@ -247,12 +253,9 @@ class TransactionController extends Controller
                 'message' => 'Transaksi berhasil dibuat',
                 'data' => $transaction->load(['customer', 'transactionDetails.service'])
             ], 201);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             DB::rollBack();
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal membuat transaksi: ' . $e->getMessage()
-            ], 500);
+            return $this->apiFailure($e, 'Gagal membuat transaksi. Coba lagi nanti.');
         }
     }
 
@@ -302,7 +305,11 @@ class TransactionController extends Controller
 
         try {
             DB::transaction(function () use ($transaction, $updates, $request): void {
+                $transaction = $this->lockedTransaction($request, (string) $transaction->id);
+                $this->assertNotCollected($transaction);
                 $before = $this->auditSnapshot($transaction);
+                $transaction->fill($updates);
+                if (!$transaction->isDirty()) return;
                 $transaction->update($updates);
                 $this->auditLog->record(
                     $request->user(),
@@ -313,11 +320,8 @@ class TransactionController extends Controller
                     ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh())],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal memperbarui transaksi: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal memperbarui transaksi. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -333,7 +337,7 @@ class TransactionController extends Controller
         $this->statusService->synchronize($ownerId);
         $transactions = Transaction::with(['customer', 'transactionDetails.service'])
             ->where('owner_id', $ownerId)
-            ->whereDate('created_at', now()->toDateString())
+            ->whereBetween('created_at', [BusinessTime::startOfDay(now()), BusinessTime::endOfDay(now())])
             ->orderByDesc('created_at')
             ->get();
 
@@ -384,7 +388,11 @@ class TransactionController extends Controller
 
         try {
             DB::transaction(function () use ($transaction, $data, $request): void {
+                $transaction = $this->lockedTransaction($request, (string) $transaction->id);
+                $this->assertNotCollected($transaction);
                 $before = $this->auditSnapshot($transaction);
+                $transaction->fill($data);
+                if (!$transaction->isDirty()) return;
                 $transaction->update($data);
                 $this->auditLog->record(
                     $request->user(),
@@ -395,11 +403,8 @@ class TransactionController extends Controller
                     ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh())],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal memperbarui status laundry: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal memperbarui status laundry. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -426,26 +431,24 @@ class TransactionController extends Controller
             'payment_status' => 'nullable|in:unpaid,downPayment,paid',
         ]);
 
-        $paidAmount = (float) $request->input('paid_amount', $transaction->paid_amount ?? 0);
-        if ($paidAmount > (float) $transaction->total_price) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Nominal pembayaran tidak boleh melebihi total tagihan.',
-            ], 422);
-        }
-        if ($paidAmount < (float) ($transaction->paid_amount ?? 0)) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Nominal pembayaran tidak boleh dikurangi setelah dicatat.',
-            ], 422);
-        }
-        $paymentStatus = $this->resolvePaymentStatus(
-            $paidAmount,
-            (float) ($transaction->total_price ?? 0),
-        );
-
         try {
-            DB::transaction(function () use ($transaction, $request, $paidAmount, $paymentStatus): void {
+            DB::transaction(function () use ($transaction, $request): void {
+                $transaction = $this->lockedTransaction($request, (string) $transaction->id);
+                $paidAmount = (float) $request->input('paid_amount');
+                if ($paidAmount > (float) $transaction->total_price) {
+                    throw ValidationException::withMessages([
+                        'paid_amount' => 'Nominal pembayaran tidak boleh melebihi total tagihan.',
+                    ]);
+                }
+                if ($paidAmount < (float) ($transaction->paid_amount ?? 0)) {
+                    throw ValidationException::withMessages([
+                        'paid_amount' => 'Nominal pembayaran tidak boleh dikurangi setelah dicatat.',
+                    ]);
+                }
+                // Cumulative balance: retry cannot add a payment or audit row.
+                if ($paidAmount === (float) ($transaction->paid_amount ?? 0)) return;
+                $this->assertNotCollected($transaction);
+                $paymentStatus = $this->resolvePaymentStatus($paidAmount, (float) $transaction->total_price);
                 $before = $this->auditSnapshot($transaction);
                 $transaction->update([
                     'paid_amount' => $paidAmount,
@@ -468,11 +471,8 @@ class TransactionController extends Controller
                     ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh())],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal mencatat pembayaran: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal mencatat pembayaran. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -528,8 +528,12 @@ class TransactionController extends Controller
             ], 422);
         }
 
+        $newProofPath = null;
         DB::beginTransaction();
         try {
+            $transaction = $this->lockedTransaction($request, $id);
+            $this->statusService->synchronizeTransaction($transaction);
+            $this->assertReadyAndPaid($transaction, $request->boolean('settle_payment'));
             $before = $this->auditSnapshot($transaction);
             $updates = [
                 'laundry_status' => 'collected',
@@ -544,7 +548,8 @@ class TransactionController extends Controller
             }
 
             if ($request->hasFile('proof_image')) {
-                $updates['proof_image_path'] = $request->file('proof_image')->store('proofs', 'public');
+                $newProofPath = $this->proofStorage->store($request->file('proof_image'));
+                $updates['proof_image_path'] = $newProofPath;
             }
 
             $transaction->update($updates);
@@ -566,12 +571,10 @@ class TransactionController extends Controller
                 'message' => 'Pengambilan laundry berhasil dicatat',
                 'data' => $transaction->fresh()->load(['customer', 'transactionDetails.service']),
             ], 200);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             DB::rollBack();
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal mencatat pengambilan: ' . $e->getMessage(),
-            ], 500);
+            $this->proofStorage->deleteNew($newProofPath);
+            return $this->apiFailure($e, 'Gagal mencatat pengambilan. Coba lagi nanti.');
         }
     }
 
@@ -646,10 +649,12 @@ class TransactionController extends Controller
             'proof_image' => ['required', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'],
         ]);
 
-        $path = $request->file('proof_image')->store('proofs', 'public');
-
+        $path = null;
         try {
-            DB::transaction(function () use ($transaction, $path, $request): void {
+            DB::transaction(function () use ($transaction, &$path, $request): void {
+                $transaction = $this->lockedTransaction($request, (string) $transaction->id);
+                $this->assertReadyAndPaid($transaction, false);
+                $path = $this->proofStorage->store($request->file('proof_image'));
                 $before = $this->auditSnapshot($transaction);
                 $transaction->update([
                     'proof_image_path' => $path,
@@ -666,11 +671,9 @@ class TransactionController extends Controller
                     ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh())],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal mencatat bukti pengambilan: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            $this->proofStorage->deleteNew($path);
+            return $this->apiFailure($e, 'Gagal mencatat bukti pengambilan. Coba lagi nanti.');
         }
 
         return response()->json([
@@ -678,6 +681,15 @@ class TransactionController extends Controller
             'message' => 'Bukti pengambilan berhasil diunggah',
             'data' => $transaction->fresh()->load(['customer', 'transactionDetails.service']),
         ], 200);
+    }
+
+    public function downloadProof(Request $request, string $id)
+    {
+        $transaction = $this->scopedTransaction($request, $id);
+        if (!$transaction || !$transaction->proof_image_path) {
+            abort(404, 'Bukti pengambilan tidak tersedia.');
+        }
+        return $this->proofStorage->response($transaction->proof_image_path);
     }
 
     public function destroy(Request $request, string $id)
@@ -707,6 +719,13 @@ class TransactionController extends Controller
 
         try {
             DB::transaction(function () use ($transaction, $request, $id): void {
+                $transaction = $this->lockedTransaction($request, $id);
+                $this->assertNotCollected($transaction);
+                if ((float) ($transaction->paid_amount ?? 0) > 0 || $transaction->payments()->exists()) {
+                    throw ValidationException::withMessages([
+                        'transaction' => 'Transaksi yang sudah memiliki pembayaran tidak dapat dihapus untuk menjaga riwayat keuangan.',
+                    ]);
+                }
                 $snapshot = $this->auditSnapshot($transaction);
                 $ownerId = $transaction->owner_id;
                 $transaction->delete();
@@ -719,17 +738,46 @@ class TransactionController extends Controller
                     ['before' => $snapshot],
                 );
             });
-        } catch (\Exception $e) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Gagal menghapus transaksi: ' . $e->getMessage(),
-            ], 500);
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal menghapus transaksi. Coba lagi nanti.');
         }
 
         return response()->json([
             'status' => 'success',
             'message' => 'Transaksi beserta detailnya berhasil dihapus'
         ], 200);
+    }
+
+    private function lockedTransaction(Request $request, string $id): Transaction
+    {
+        return Transaction::query()
+            ->where('owner_id', $this->ownerScope->idFor($request->user()))
+            ->lockForUpdate()->findOrFail($id);
+    }
+
+    private function assertNotCollected(Transaction $transaction): void
+    {
+        if ($transaction->laundry_status === 'collected') {
+            throw ValidationException::withMessages([
+                'transaction' => 'Transaksi yang sudah diambil tidak dapat diubah kembali.',
+            ]);
+        }
+    }
+
+    private function assertReadyAndPaid(Transaction $transaction, bool $settlePayment): void
+    {
+        $this->assertNotCollected($transaction);
+        if (!in_array($transaction->laundry_status, ['completed', 'late'], true)) {
+            throw ValidationException::withMessages([
+                'transaction' => 'Laundry hanya dapat diambil setelah selesai atau terlambat.',
+            ]);
+        }
+        // A status label is not proof of payment when the balance disagrees.
+        if (!$settlePayment && (float) ($transaction->paid_amount ?? 0) < (float) $transaction->total_price) {
+            throw ValidationException::withMessages([
+                'paid_amount' => 'Transaksi harus dilunasi sebelum laundry dapat diambil.',
+            ]);
+        }
     }
 
     private function scopedTransaction(Request $request, string $id, bool $withRelations = false): ?Transaction

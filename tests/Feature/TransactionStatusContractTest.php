@@ -131,6 +131,7 @@ class TransactionStatusContractTest extends TestCase
             'order_status' => 'completed',
         ]);
         Storage::fake('public');
+        Storage::fake('proofs');
 
         $response = $this->postJson('/api/transactions/' . $transaction->id . '/collection', [
             'settle_payment' => true,
