@@ -1,0 +1,14 @@
+### 1. Login untuk ambil Token
+POST http://localhost/api-indafri-laundry/public/api/auth/login
+Content-Type: application/json
+Accept: application/json
+
+{
+  "username": "owner",
+  "password": "owner123"
+}
+
+### 2. Tes API Dashboard Owner
+GET http://localhost/api-indafri-laundry/public/api/dashboard/owner
+Authorization: Bearer 47|c7nWCwYQ9cUh3dFS03JqFjyLyIUO52CHk3eeqyk17786c79f
+Accept: application/json
