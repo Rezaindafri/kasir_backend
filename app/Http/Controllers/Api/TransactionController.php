@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Transaction;
 use App\Models\TransactionDetail;
 use App\Models\TransactionPayment;
+use App\Models\PaymentDestination;
 use App\Models\Customer;
 use App\Models\Service;
 use App\Models\User;
@@ -44,6 +45,7 @@ class TransactionController extends Controller
             'to' => ['nullable', 'date'],
             'collected' => ['nullable', 'boolean'],
             'active_processing' => ['nullable', 'boolean'],
+            'ready_for_collection' => ['nullable', 'boolean'],
             'cashier_id' => ['nullable', 'integer'],
             'sort' => ['nullable', 'in:created_at,estimated_finish_at'],
             'direction' => ['nullable', 'in:asc,desc'],
@@ -89,9 +91,10 @@ class TransactionController extends Controller
         // The cashier's "Diproses" category is time-bound: active laundry
         // status and an estimated completion time that has not passed.
         if (!empty($validated['active_processing'])) {
-            $query->whereIn('laundry_status', ['received', 'washing', 'drying', 'ironing'])
-                ->whereNotNull('estimated_finish_at')
-                ->where('estimated_finish_at', '>', now());
+            $query->activelyProcessing();
+        }
+        if (!empty($validated['ready_for_collection'])) {
+            $query->readyForCollection();
         }
 
         if (!empty($validated['payment_status'])) {
@@ -141,11 +144,14 @@ class TransactionController extends Controller
             'customer_id' => 'required|exists:customers,id',
             'payment_status' => 'sometimes|in:unpaid,downPayment,paid',
             'payment_method' => 'sometimes|in:cash,qris,transfer',
+            'payment_destination_id' => 'nullable|integer|min:1',
             'paid_amount' => 'sometimes|numeric|min:0',
-            'services' => 'required|array|min:1',
+            'services' => 'required|array|min:1|max:50',
             'services.*.service_id' => 'required|exists:services,id',
-            'services.*.qty' => 'required|numeric|min:0.1',
+            'services.*.qty' => 'required|numeric|min:0.1|max:100000',
             'services.*.price' => 'required|numeric|min:0',
+            'services.*.express' => 'sometimes|boolean',
+            'notes' => 'nullable|string|max:2000',
         ]);
 
         DB::beginTransaction();
@@ -175,15 +181,33 @@ class TransactionController extends Controller
             $invoiceNumber = 'INV-' . now()->format('YmdHisv') . '-' . strtoupper(bin2hex(random_bytes(3)));
 
             $totalPrice = 0;
+            $lineValues = [];
+            $startedAt = now();
+            $estimatedFinishAt = null;
             foreach ($request->services as $item) {
-                $totalPrice += ($item['qty'] * $services[$item['service_id']]->price);
+                $service = $services[$item['service_id']];
+                $base = round($item['qty'] * $service->price);
+                $expressFee = !empty($item['express']) ? round($base * .25) : 0;
+                $duration = max(0, (int) $service->estimation_hours);
+                $finish = $duration > 0 ? $startedAt->copy()->addHours($duration) : null;
+                if ($finish && (!$estimatedFinishAt || $finish->gt($estimatedFinishAt))) $estimatedFinishAt = $finish;
+                $lineValues[] = [
+                    'service_id' => $service->id,
+                    'service_name' => $service->name,
+                    'service_unit' => $service->unit,
+                    'qty' => $item['qty'],
+                    'price' => $service->price,
+                    'express_fee' => $expressFee,
+                    'subtotal' => $base + $expressFee,
+                    'timing_configured' => true,
+                    'estimated_finish_at' => $finish,
+                    'late_at' => $duration > 0 ? $startedAt->copy()->addHours($duration * 2) : null,
+                ];
+                $totalPrice += $base + $expressFee;
             }
             // The deadline comes from the owner's service configuration, not
             // from a client payload. For multiple services, the longest
             // configured duration is the operational completion deadline.
-            $estimatedFinishAt = now()->addHours(
-                max(1, (int) $services->max('estimation_hours')),
-            );
 
             $paidAmount = (float) $request->input(
                 'paid_amount',
@@ -216,18 +240,10 @@ class TransactionController extends Controller
                 'notes' => $request->input('notes'),
             ]);
 
-            foreach ($request->services as $item) {
-                $price = $services[$item['service_id']]->price;
-                $subtotal = $item['qty'] * $price;
-
-                TransactionDetail::create([
-                    'transaction_id' => $transaction->id,
-                    'service_id' => $item['service_id'],
-                    'qty' => $item['qty'],
-                    'price' => $price,
-                    'subtotal' => $subtotal,
-                ]);
+            foreach ($lineValues as $line) {
+                $transaction->transactionDetails()->create($line);
             }
+            $this->statusService->synchronizeTransaction($transaction, false);
 
             if ($paidAmount > 0) {
                 $this->recordPayment(
@@ -274,7 +290,7 @@ class TransactionController extends Controller
 
         return response()->json([
             'status' => 'success',
-            'data' => $transaction
+            'data' => $transaction->load(['payments.recorder:id,name'])
         ], 200);
     }
 
@@ -353,7 +369,7 @@ class TransactionController extends Controller
         $this->statusService->synchronize($ownerId);
         $transactions = Transaction::with(['customer', 'transactionDetails.service'])
             ->where('owner_id', $ownerId)
-            ->whereIn('laundry_status', ['completed', 'late'])
+            ->readyForCollection()
             ->orderByDesc('created_at')
             ->get();
 
@@ -426,15 +442,33 @@ class TransactionController extends Controller
         }
 
         $request->validate([
-            'paid_amount' => 'required|numeric|min:0',
+            'paid_amount' => 'required_without:amount|prohibits:amount|numeric|min:0',
+            'amount' => 'required_without:paid_amount|prohibits:paid_amount|numeric|min:1',
+            'request_id' => 'required_with:amount|nullable|uuid',
+            'payment_note' => 'nullable|string|max:1000',
             'payment_method' => 'nullable|in:cash,qris,transfer',
             'payment_status' => 'nullable|in:unpaid,downPayment,paid',
+            'payment_destination_id' => 'nullable|integer|min:1',
         ]);
 
         try {
             DB::transaction(function () use ($transaction, $request): void {
                 $transaction = $this->lockedTransaction($request, (string) $transaction->id);
-                $paidAmount = (float) $request->input('paid_amount');
+                if ($request->filled('request_id')) {
+                    $existing = $transaction->payments()->where('request_id', $request->input('request_id'))->first();
+                    if ($existing) {
+                        if ((float) $existing->amount !== (float) $request->input('amount') ||
+                            $existing->payment_method !== $request->input('payment_method', $existing->payment_method) ||
+                            $existing->payment_destination_id != $request->input('payment_destination_id') ||
+                            $existing->notes !== $request->input('payment_note')) {
+                            throw ValidationException::withMessages(['request_id' => 'Permintaan pembayaran sudah digunakan dengan data berbeda.']);
+                        }
+                        return;
+                    }
+                }
+                $paidAmount = $request->has('amount')
+                    ? (float) ($transaction->paid_amount ?? 0) + (float) $request->input('amount')
+                    : (float) $request->input('paid_amount');
                 if ($paidAmount > (float) $transaction->total_price) {
                     throw ValidationException::withMessages([
                         'paid_amount' => 'Nominal pembayaran tidak boleh melebihi total tagihan.',
@@ -483,8 +517,8 @@ class TransactionController extends Controller
     }
 
     /**
-     * Completes a handover in one operation. Payment settlement and a proof image
-     * are optional, but every successful handover is recorded as collected.
+     * Records a full or partial handover atomically with any extra payment.
+     * Only selected ready lines are collected; the invoice closes after all lines.
      */
     public function collect(Request $request, string $id)
     {
@@ -506,44 +540,61 @@ class TransactionController extends Controller
             ], 422);
         }
 
-        if (!in_array($transaction->laundry_status, ['completed', 'late'], true)) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Laundry hanya dapat diambil setelah selesai atau terlambat',
-            ], 422);
-        }
-
         $validated = $request->validate([
             'settle_payment' => ['sometimes', 'boolean'],
             'payment_method' => ['nullable', 'in:cash,qris,transfer'],
             'proof_image' => ['nullable', 'image', 'mimes:jpg,jpeg,png,webp', 'max:2048'],
+            'detail_ids' => ['sometimes', 'array', 'min:1', 'max:50'],
+            'detail_ids.*' => ['required', 'integer', 'distinct'],
+            'payment_amount' => ['sometimes', 'numeric', 'min:0'],
+            'payment_note' => ['nullable', 'string', 'max:1000'],
+            'payment_destination_id' => ['nullable', 'integer', 'min:1'],
         ]);
-
-        $isPaid = (float) ($transaction->paid_amount ?? 0) >= (float) $transaction->total_price ||
-            $transaction->payment_status === 'paid';
-        if (!$isPaid && !$request->boolean('settle_payment')) {
-            return response()->json([
-                'status' => 'error',
-                'message' => 'Transaksi harus dilunasi sebelum laundry dapat diambil',
-            ], 422);
-        }
 
         $newProofPath = null;
         DB::beginTransaction();
         try {
             $transaction = $this->lockedTransaction($request, $id);
             $this->statusService->synchronizeTransaction($transaction);
-            $this->assertReadyAndPaid($transaction, $request->boolean('settle_payment'));
+            $this->assertNotCollected($transaction);
+            $lines = $transaction->transactionDetails()->orderBy('id')->lockForUpdate()->get();
+            $lines->each(fn ($line) => $line->setRelation('transaction', $transaction));
+            $remainingLines = $lines->where('is_collected', false);
+            $selected = isset($validated['detail_ids'])
+                ? $remainingLines->whereIn('id', $validated['detail_ids'])
+                : $remainingLines;
+            if (isset($validated['detail_ids']) && $selected->count() !== count($validated['detail_ids'])) {
+                throw ValidationException::withMessages(['detail_ids' => 'Layanan tidak tersedia pada transaksi ini atau sudah diambil.']);
+            }
+            if ($lines->isNotEmpty()) {
+                if ($selected->isEmpty() || $selected->contains(fn ($line) => !$line->is_ready)) {
+                    throw ValidationException::withMessages(['detail_ids' => 'Pilih hanya layanan yang sudah selesai dan belum diambil.']);
+                }
+                // Existing DP is credit for this invoice. Cover the cumulative
+                // value handed over, rather than charging each line twice.
+                $requiredPaid = $selected->count() === $remainingLines->count()
+                    ? (float) $transaction->total_price
+                    : min((float) $transaction->total_price, (float) $lines->where('is_collected', true)->sum('subtotal') + (float) $selected->sum('subtotal'));
+            } else {
+                $this->assertReadyAndPaid($transaction, true);
+                $requiredPaid = (float) $transaction->total_price;
+            }
+            $balance = max(0, (float) $transaction->total_price - (float) ($transaction->paid_amount ?? 0));
+            $additionalPayment = isset($validated['payment_amount'])
+                ? (float) $validated['payment_amount']
+                : ($request->boolean('settle_payment') ? $balance : 0);
+            $paidAfter = (float) ($transaction->paid_amount ?? 0) + $additionalPayment;
+            if ($additionalPayment > $balance || $paidAfter < $requiredPaid) {
+                throw ValidationException::withMessages(['payment_amount' => $lines->isEmpty() && $paidAfter < $requiredPaid
+                    ? 'Transaksi harus dilunasi sebelum laundry dapat diambil'
+                    : 'Pembayaran harus mencukupi layanan yang diambil dan tidak melebihi sisa tagihan.']);
+            }
             $before = $this->auditSnapshot($transaction);
             $updates = [
-                'laundry_status' => 'collected',
-                'order_status' => 'delivered',
+                'paid_amount' => $paidAfter,
+                'payment_status' => $this->resolvePaymentStatus($paidAfter, (float) $transaction->total_price),
             ];
-
-            if ($request->boolean('settle_payment')) {
-                $remainingPayment = max(0, (float) $transaction->total_price - (float) ($transaction->paid_amount ?? 0));
-                $updates['paid_amount'] = $transaction->total_price;
-                $updates['payment_status'] = 'paid';
+            if ($additionalPayment > 0) {
                 $updates['payment_method'] = $validated['payment_method'] ?? $transaction->payment_method ?? 'cash';
             }
 
@@ -551,18 +602,32 @@ class TransactionController extends Controller
                 $newProofPath = $this->proofStorage->store($request->file('proof_image'));
                 $updates['proof_image_path'] = $newProofPath;
             }
-
-            $transaction->update($updates);
-            if (isset($remainingPayment) && $remainingPayment > 0) {
-                $this->recordPayment($transaction, $request, $remainingPayment, 'collection_settlement');
+            if ($lines->isEmpty() || $selected->count() === $remainingLines->count()) {
+                $updates['laundry_status'] = 'collected';
+                $updates['order_status'] = 'delivered';
             }
+            foreach ($selected as $line) {
+                $line->update([
+                    'is_collected' => true,
+                    'collected_at' => now(),
+                    'collected_by' => $request->user()->id,
+                    'proof_image_path' => $newProofPath,
+                ]);
+            }
+            $transaction->update($updates);
+            if ($additionalPayment > 0) {
+                $this->recordPayment($transaction, $request, $additionalPayment, 'collection_settlement');
+            }
+            $this->statusService->synchronizeTransaction($transaction, false);
+            $isComplete = $transaction->laundry_status === 'collected';
             $this->auditLog->record(
                 $request->user(),
                 $transaction->owner_id,
                 'transaction',
                 $transaction->id,
-                'transaction.collected',
-                ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh())],
+                $isComplete ? 'transaction.collected' : 'transaction.partially_collected',
+                ['before' => $before, 'after' => $this->auditSnapshot($transaction->fresh()),
+                    'detail_ids' => $selected->pluck('id')->values()->all(), 'payment_note' => $request->input('payment_note')],
             );
             DB::commit();
 
@@ -597,6 +662,23 @@ class TransactionController extends Controller
         float $amount,
         string $source,
     ): void {
+        $method = $request->input('payment_method', $transaction->payment_method ?? 'cash');
+        $destination = null;
+        if ($request->filled('payment_destination_id')) {
+            $destination = PaymentDestination::where('owner_id', $transaction->owner_id)
+                ->where('kind', $method)->where('is_active', true)
+                ->lockForUpdate()->find($request->integer('payment_destination_id'));
+            if (!$destination || $method === 'cash') {
+                throw ValidationException::withMessages([
+                    'payment_destination_id' => 'Tujuan pembayaran tidak tersedia untuk metode/kelompok ini.',
+                ]);
+            }
+        } elseif ($method !== 'cash' && PaymentDestination::where('owner_id', $transaction->owner_id)
+            ->where('kind', $method)->where('is_active', true)->exists()) {
+            throw ValidationException::withMessages([
+                'payment_destination_id' => 'Pilih tujuan pembayaran yang digunakan.',
+            ]);
+        }
         TransactionPayment::create([
             'owner_id' => $transaction->owner_id,
             'transaction_id' => $transaction->id,
@@ -605,6 +687,10 @@ class TransactionController extends Controller
             'payment_method' => $request->input('payment_method', $transaction->payment_method ?? 'cash'),
             'paid_at' => now(),
             'source' => $source,
+            'notes' => $request->input('payment_note'),
+            'request_id' => $source === 'payment' ? $request->input('request_id') : null,
+            'payment_destination_id' => $destination?->id,
+            'payment_destination_label' => $destination ? mb_substr($destination->label(), 0, 255) : null,
         ]);
     }
 
@@ -661,6 +747,10 @@ class TransactionController extends Controller
                     'laundry_status' => 'collected',
                     'order_status' => 'delivered',
                 ]);
+                $transaction->transactionDetails()->where('is_collected', false)->update([
+                    'is_collected' => true, 'collected_at' => now(),
+                    'collected_by' => $request->user()->id, 'proof_image_path' => $path,
+                ]);
 
                 $this->auditLog->record(
                     $request->user(),
@@ -686,10 +776,15 @@ class TransactionController extends Controller
     public function downloadProof(Request $request, string $id)
     {
         $transaction = $this->scopedTransaction($request, $id);
-        if (!$transaction || !$transaction->proof_image_path) {
+        if (!$transaction) {
             abort(404, 'Bukti pengambilan tidak tersedia.');
         }
-        return $this->proofStorage->response($transaction->proof_image_path);
+        $request->validate(['detail_id' => ['nullable', 'integer']]);
+        $path = $request->filled('detail_id')
+            ? $transaction->transactionDetails()->find($request->integer('detail_id'))?->proof_image_path
+            : $transaction->proof_image_path;
+        if (!$path) abort(404, 'Bukti pengambilan tidak tersedia.');
+        return $this->proofStorage->response($path);
     }
 
     public function destroy(Request $request, string $id)
@@ -721,7 +816,8 @@ class TransactionController extends Controller
             DB::transaction(function () use ($transaction, $request, $id): void {
                 $transaction = $this->lockedTransaction($request, $id);
                 $this->assertNotCollected($transaction);
-                if ((float) ($transaction->paid_amount ?? 0) > 0 || $transaction->payments()->exists()) {
+                if ((float) ($transaction->paid_amount ?? 0) > 0 || $transaction->payments()->exists() ||
+                    $transaction->transactionDetails()->where('is_collected', true)->exists()) {
                     throw ValidationException::withMessages([
                         'transaction' => 'Transaksi yang sudah memiliki pembayaran tidak dapat dihapus untuk menjaga riwayat keuangan.',
                     ]);
@@ -767,6 +863,11 @@ class TransactionController extends Controller
     private function assertReadyAndPaid(Transaction $transaction, bool $settlePayment): void
     {
         $this->assertNotCollected($transaction);
+        $lines = $transaction->transactionDetails()->get();
+        $lines->each(fn ($line) => $line->setRelation('transaction', $transaction));
+        if ($lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready)) {
+            throw ValidationException::withMessages(['transaction' => 'Masih ada layanan yang belum selesai.']);
+        }
         if (!in_array($transaction->laundry_status, ['completed', 'late'], true)) {
             throw ValidationException::withMessages([
                 'transaction' => 'Laundry hanya dapat diambil setelah selesai atau terlambat.',
@@ -802,7 +903,7 @@ class TransactionController extends Controller
     /** @return array<string, mixed> */
     private function auditSnapshot(Transaction $transaction): array
     {
-        return $transaction->only([
+        return [...$transaction->only([
             'invoice_number',
             'customer_id',
             'cashier_id',
@@ -813,6 +914,9 @@ class TransactionController extends Controller
             'laundry_status',
             'order_status',
             'estimated_finish_at',
-        ]);
+        ]), 'details' => $transaction->transactionDetails()->get()->map(fn ($line) => $line->only([
+            'id', 'service_id', 'service_name', 'service_unit', 'qty', 'price', 'express_fee',
+            'subtotal', 'estimated_finish_at', 'is_collected', 'collected_at', 'collected_by',
+        ]))->all()];
     }
 }

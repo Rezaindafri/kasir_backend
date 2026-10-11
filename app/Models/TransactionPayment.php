@@ -14,6 +14,10 @@ class TransactionPayment extends Model
         'payment_method',
         'paid_at',
         'source',
+        'notes',
+        'request_id',
+        'payment_destination_id',
+        'payment_destination_label',
     ];
 
     protected $casts = [

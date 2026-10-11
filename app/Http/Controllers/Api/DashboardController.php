@@ -57,22 +57,17 @@ class DashboardController extends Controller
             ->where('owner_id', $ownerId)
             ->when($cashierId, fn ($query) => $query->where('cashier_id', $cashierId))
             ->where('laundry_status', '!=', 'collected');
-        $processingStatuses = ['received', 'washing', 'drying', 'ironing'];
         $processing = (clone $operationalQuery)
-            ->whereIn('laundry_status', $processingStatuses)
-            ->whereNotNull('estimated_finish_at')
-            ->where('estimated_finish_at', '>', $now)
+            ->activelyProcessing()
             ->count();
         $readyToPickup = (clone $operationalQuery)
-            ->whereIn('laundry_status', ['completed', 'late'])
+            ->readyForCollection()
             ->count();
         $late = (clone $operationalQuery)
             ->where('laundry_status', 'late')
             ->count();
         $dueSoon = (clone $operationalQuery)
-            ->whereIn('laundry_status', $processingStatuses)
-            ->whereBetween('estimated_finish_at', [$now, $now->copy()->addHours(24)])
-            ->count();
+            ->with('transactionDetails')->get()->filter(fn ($transaction) => $transaction->hasDueSoonItems())->count();
         $serviceDistribution = $transactions->flatMap(fn (Transaction $transaction) => $transaction->transactionDetails)
             ->groupBy('service_id')
             ->map(fn ($details) => [
@@ -234,13 +229,7 @@ class DashboardController extends Controller
 
         $todayTransactionsPayload = $todayTransactions->map(fn ($transaction) => $this->transactionPayload($transaction))->values();
 
-        $inProgress = $operationalTransactions->filter(function ($transaction) use ($now) {
-            return !empty($transaction->estimated_finish_at) &&
-                $transaction->estimated_finish_at->greaterThan($now) &&
-                in_array($transaction->laundry_status ?? 'received', [
-                'received', 'washing', 'drying', 'ironing',
-            ], true);
-        })->count();
+        $inProgress = $operationalTransactions->filter(fn ($transaction) => $transaction->is_processing)->count();
 
         $completed = $operationalTransactions->filter(function ($transaction) {
             return ($transaction->laundry_status ?? 'received') === 'completed';
@@ -250,29 +239,12 @@ class DashboardController extends Controller
             return ($transaction->laundry_status ?? 'received') === 'late';
         })->count();
 
-        // "Belum Diambil" is a ready-to-handover queue, not every active
-        // order. Laundry still being processed belongs only to Diproses.
+        // A mixed invoice may have both processing and ready services.
         $readyToPickupItems = $operationalTransactions
-            ->filter(fn ($transaction) => in_array(
-                $transaction->laundry_status ?? 'received',
-                ['completed', 'late'],
-                true,
-            ))
+            ->filter(fn ($transaction) => $transaction->has_ready_items)
             ->values();
 
-        $dueSoonItems = $operationalTransactions->filter(function ($transaction) use ($now) {
-            if (empty($transaction->estimated_finish_at)) {
-                return false;
-            }
-
-            $status = $transaction->laundry_status ?? 'received';
-            if (!in_array($status, ['received', 'washing', 'drying', 'ironing'], true)) {
-                return false;
-            }
-
-            return $transaction->estimated_finish_at->greaterThanOrEqualTo($now)
-                && $transaction->estimated_finish_at->lessThanOrEqualTo($now->copy()->addHours(24));
-        })->values();
+        $dueSoonItems = $operationalTransactions->filter(fn ($transaction) => $transaction->hasDueSoonItems())->values();
 
         return response()->json([
             'status' => 'success',
@@ -392,16 +364,8 @@ class DashboardController extends Controller
                     'total_revenue' => $this->revenueFor($ownerId),
                     'total_transactions' => $items->count(),
                     'total_customers' => Customer::where('owner_id', $ownerId)->count(),
-                    'in_progress' => $items->filter(fn (Transaction $transaction) =>
-                        in_array($transaction->laundry_status ?? 'received', ['received', 'washing', 'drying', 'ironing'], true) &&
-                        $transaction->estimated_finish_at &&
-                        $transaction->estimated_finish_at->greaterThan(now())
-                    )->count(),
-                    'ready_to_pickup' => $items->filter(fn ($transaction) => in_array(
-                        $transaction->laundry_status ?? 'received',
-                        ['completed', 'late'],
-                        true,
-                    ))->count(),
+                    'in_progress' => $items->filter(fn ($transaction) => $transaction->is_processing)->count(),
+                    'ready_to_pickup' => $items->filter(fn ($transaction) => $transaction->has_ready_items)->count(),
                 ],
                 'services' => $serviceStats,
             ],
@@ -470,12 +434,8 @@ class DashboardController extends Controller
                     'orders_received' => $transactions->count(),
                     'completed' => $transactions->where('laundry_status', 'completed')->count(),
                     'late' => $transactions->where('laundry_status', 'late')->count(),
-                    'ready_to_pickup' => $transactions->whereIn('laundry_status', ['completed', 'late'])->count(),
-                    'in_progress' => $transactions->filter(fn (Transaction $transaction) =>
-                        in_array($transaction->laundry_status, ['received', 'washing', 'drying', 'ironing'], true) &&
-                        $transaction->estimated_finish_at &&
-                        $transaction->estimated_finish_at->greaterThan($now)
-                    )->count(),
+                    'ready_to_pickup' => $transactions->filter(fn ($transaction) => $transaction->has_ready_items)->count(),
+                    'in_progress' => $transactions->filter(fn ($transaction) => $transaction->is_processing)->count(),
                 ],
                 'attention_items' => $this->attentionItems($transactions, $now),
                 'accounts' => $accounts->map(fn (User $account) => [
@@ -538,7 +498,7 @@ class DashboardController extends Controller
             ], 200);
         }
 
-        $columns = ['invoice_number', 'customer_name', 'payment_method', 'payment_amount', 'paid_at', 'source', 'timezone'];
+        $columns = ['invoice_number', 'customer_name', 'payment_method', 'payment_amount', 'paid_at', 'source', 'timezone', 'payment_note'];
         $rows = [implode(',', $columns)];
 
         foreach ($payments as $payment) {
@@ -551,6 +511,7 @@ class DashboardController extends Controller
                 $this->csvValue($payment->paid_at ? BusinessTime::local($payment->paid_at)->toDateTimeString() : ''),
                 $this->csvValue($payment->source ?? 'payment'),
                 'WIB',
+                $this->csvValue($payment->notes ?? ''),
             ]);
         }
 
@@ -638,6 +599,7 @@ class DashboardController extends Controller
             'payment_method' => $payment->payment_method,
             'paid_at' => $payment->paid_at?->toIso8601String(),
             'payment_source' => $payment->source,
+            'payment_note' => $payment->notes,
             'recorded_by' => $payment->recorder ? [
                 'id' => $payment->recorder->id,
                 'name' => $payment->recorder->name,
@@ -650,7 +612,7 @@ class DashboardController extends Controller
     private function transactionPayload(Transaction $transaction): array
     {
         $firstDetail = $transaction->transactionDetails->first();
-        $serviceName = $firstDetail?->service?->name ?? 'Layanan';
+        $serviceName = $transaction->transactionDetails->map(fn ($line) => $line->service_name ?? $line->service?->name ?? 'Layanan')->implode(' + ');
         $total = (int) ($transaction->total_price ?? $transaction->total ?? 0);
         $paidAmount = (int) ($transaction->paid_amount ?? 0);
         $status = $transaction->laundry_status ?? $transaction->order_status ?? 'received';
@@ -673,6 +635,9 @@ class DashboardController extends Controller
             'estimated_finish_at' => $transaction->estimated_finish_at?->toIso8601String(),
             'notes' => $transaction->notes,
             'has_proof_image' => $transaction->has_proof_image,
+            'details' => $transaction->transactionDetails,
+            'has_ready_items' => $transaction->has_ready_items,
+            'is_processing' => $transaction->is_processing,
         ];
     }
 

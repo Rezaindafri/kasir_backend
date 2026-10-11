@@ -32,7 +32,7 @@ class ServiceController extends Controller
             'name' => 'required|string|max:255',
             'price' => 'required|numeric|min:0',
             'unit' => 'required|string|max:50',
-            'estimation_hours' => 'required|integer|min:1',
+            'estimation_hours' => 'nullable|integer|min:0|max:87600',
         ]);
 
         $service = Service::create([
@@ -40,7 +40,7 @@ class ServiceController extends Controller
             'name' => $request->name,
             'price' => $request->price,
             'unit' => $request->unit,
-            'estimation_hours' => $request->estimation_hours,
+            'estimation_hours' => $request->input('estimation_hours') ?? 0,
         ]);
 
         return response()->json([
@@ -84,14 +84,14 @@ class ServiceController extends Controller
             'name' => 'required|string|max:255',
             'price' => 'required|numeric|min:0',
             'unit' => 'required|string|max:50',
-            'estimation_hours' => 'required|integer|min:1',
+            'estimation_hours' => 'nullable|integer|min:0|max:87600',
         ]);
 
         $service->update([
             'name' => $request->name,
             'price' => $request->price,
             'unit' => $request->unit,
-            'estimation_hours' => $request->estimation_hours,
+            'estimation_hours' => $request->input('estimation_hours') ?? 0,
         ]);
 
         return response()->json([

@@ -20,35 +20,44 @@ class TransactionStatusService
     {
         Transaction::query()
             ->when($ownerId, fn ($query) => $query->where('owner_id', $ownerId))
-            ->whereNotIn('laundry_status', ['collected', 'late'])
-            ->whereNotNull('estimated_finish_at')
+            ->where('laundry_status', '!=', 'collected')
             ->get()
             ->each(fn (Transaction $transaction) => $this->synchronizeTransaction($transaction));
     }
 
-    public function synchronizeTransaction(Transaction $transaction): void
+    public function synchronizeTransaction(Transaction $transaction, bool $recordAudit = true): void
     {
-        DB::transaction(function () use ($transaction): void {
+        DB::transaction(function () use ($transaction, $recordAudit): void {
             // A scheduler/model loaded before collection must not overwrite
             // the terminal status committed by another request.
             $current = Transaction::query()->whereKey($transaction->id)->lockForUpdate()->first();
             if (!$current) return;
-            if (in_array($current->laundry_status, ['collected', 'late'], true) ||
-                !$current->estimated_finish_at) {
+            if ($current->laundry_status === 'collected') {
                 $transaction->setRawAttributes($current->getAttributes(), true);
                 return;
             }
-
-            $now = now();
-            $estimatedFinishAt = Carbon::parse($current->estimated_finish_at);
-            if ($now->lt($estimatedFinishAt)) {
-                $transaction->setRawAttributes($current->getAttributes(), true);
-                return;
+            $lines = $current->transactionDetails()->get();
+            $lines->each(fn ($line) => $line->setRelation('transaction', $current));
+            if ($lines->contains(fn ($line) => $line->timing_configured)) {
+                $remaining = $lines->where('is_collected', false);
+                $status = match (true) {
+                    $remaining->isEmpty() => 'collected',
+                    $remaining->contains(fn ($line) => $line->laundry_status === 'late') => 'late',
+                    $remaining->every(fn ($line) => $line->is_ready) => 'completed',
+                    in_array($current->laundry_status, ['received', 'washing', 'drying', 'ironing'], true) => $current->laundry_status,
+                    default => 'received',
+                };
+            } else {
+                // Legacy transactions without line timing retain the old
+                // deadline/status contract, including unknown/null estimates.
+                if ($current->laundry_status === 'late' || !$current->estimated_finish_at || now()->lt($current->estimated_finish_at)) {
+                    $transaction->setRawAttributes($current->getAttributes(), true);
+                    return;
+                }
+                $finish = Carbon::parse($current->estimated_finish_at);
+                $seconds = max(0, $finish->diffInSeconds(Carbon::parse($current->created_at), true));
+                $status = now()->gt($finish->copy()->addSeconds($seconds)) ? 'late' : 'completed';
             }
-            $createdAt = Carbon::parse($current->created_at);
-            $serviceDurationSeconds = max(0, $estimatedFinishAt->diffInSeconds($createdAt, true));
-            $lateAt = $estimatedFinishAt->copy()->addSeconds($serviceDurationSeconds);
-            $status = $now->gt($lateAt) ? 'late' : 'completed';
 
             if ($current->laundry_status !== $status) {
                 $before = $current->only([
@@ -58,9 +67,14 @@ class TransactionStatusService
                 ]);
                 $current->update([
                     'laundry_status' => $status,
-                    'order_status' => $status === 'late' ? 'processing' : 'completed',
+                    'order_status' => match ($status) {
+                        'collected' => 'delivered',
+                        'completed' => 'completed',
+                        'received' => 'new',
+                        default => 'processing',
+                    },
                 ]);
-                $this->auditLog->record(
+                if ($recordAudit) $this->auditLog->record(
                     null,
                     $current->owner_id,
                     'transaction',
@@ -77,6 +91,7 @@ class TransactionStatusService
                 );
             }
             $transaction->setRawAttributes($current->getAttributes(), true);
+            $transaction->unsetRelation('transactionDetails');
         });
     }
 }

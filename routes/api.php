@@ -7,6 +7,7 @@ use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\ExpenseController;
 use App\Http\Controllers\Api\ServiceController;
 use App\Http\Controllers\Api\SettingsController;
+use App\Http\Controllers\Api\PaymentDestinationController;
 use App\Http\Controllers\Api\SystemSettingsController;
 use App\Http\Controllers\Api\TransactionController;
 use App\Http\Controllers\Api\UserController;
@@ -27,6 +28,8 @@ Route::middleware(['auth:sanctum', 'active'])->group(function () {
     Route::patch('/profile/password', [AuthController::class, 'updatePassword']);
     Route::middleware('role:owner,kasir')->group(function () {
         Route::get('/settings', [SettingsController::class, 'show']);
+        Route::get('/settings/payment-destinations', [PaymentDestinationController::class, 'index']);
+        Route::get('/settings/payment-destinations/{id}/image', [PaymentDestinationController::class, 'image']);
     });
 
     // Kasir membutuhkan pelanggan dan katalog layanan untuk membuat transaksi,
@@ -64,6 +67,9 @@ Route::middleware(['auth:sanctum', 'active'])->group(function () {
         Route::match(['put', 'patch'], '/transactions/{id}', [TransactionController::class, 'update']);
         Route::delete('/transactions/{id}', [TransactionController::class, 'destroy']);
         Route::patch('/settings', [SettingsController::class, 'update']);
+        Route::post('/settings/payment-destinations', [PaymentDestinationController::class, 'store']);
+        // Multipart updates work consistently in PHP via POST + _method=PATCH.
+        Route::patch('/settings/payment-destinations/{id}', [PaymentDestinationController::class, 'update']);
         Route::get('/dashboard/owner', [DashboardController::class, 'owner']);
         Route::get('/dashboard/owner/financial', [DashboardController::class, 'ownerFinancial']);
         Route::get('/reports/revenue', [DashboardController::class, 'revenue']);
