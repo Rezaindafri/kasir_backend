@@ -65,7 +65,6 @@ Route::middleware(['auth:sanctum', 'active'])->group(function () {
     Route::middleware('role:owner')->group(function () {
         Route::get('/audit-logs', [AuditLogController::class, 'index']);
         Route::match(['put', 'patch'], '/transactions/{id}', [TransactionController::class, 'update']);
-        Route::delete('/transactions/{id}', [TransactionController::class, 'destroy']);
         Route::patch('/settings', [SettingsController::class, 'update']);
         Route::post('/settings/payment-destinations', [PaymentDestinationController::class, 'store']);
         // Multipart updates work consistently in PHP via POST + _method=PATCH.
@@ -96,6 +95,8 @@ Route::middleware(['auth:sanctum', 'active'])->group(function () {
         Route::get('/transactions/{id}/proof', [TransactionController::class, 'downloadProof']);
         Route::post('/transactions/{id}/collection', [TransactionController::class, 'collect']);
         Route::patch('/transactions/{id}/status', [TransactionController::class, 'updateStatus']);
+        Route::post('/transactions/{id}/complete-service', [TransactionController::class, 'completeService']);
+        Route::delete('/transactions/{id}', [TransactionController::class, 'destroy']);
         Route::post('/transactions/{id}/payment', [TransactionController::class, 'markPayment']);
         Route::post('/transactions/{id}/proof', [TransactionController::class, 'uploadProof']);
     });

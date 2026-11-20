@@ -38,7 +38,7 @@ class TransactionStatusService
             }
             $lines = $current->transactionDetails()->get();
             $lines->each(fn ($line) => $line->setRelation('transaction', $current));
-            if ($lines->contains(fn ($line) => $line->timing_configured)) {
+            if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
                 $remaining = $lines->where('is_collected', false);
                 $status = match (true) {
                     $remaining->isEmpty() => 'collected',

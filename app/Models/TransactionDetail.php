@@ -20,6 +20,7 @@ class TransactionDetail extends Model
         'timing_configured',
         'estimated_finish_at',
         'late_at',
+        'manually_completed_at',
         'express_fee',
         'is_collected',
         'collected_at',
@@ -32,6 +33,7 @@ class TransactionDetail extends Model
         'is_collected' => 'boolean',
         'estimated_finish_at' => 'datetime',
         'late_at' => 'datetime',
+        'manually_completed_at' => 'datetime',
         'collected_at' => 'datetime',
     ];
 
@@ -41,6 +43,7 @@ class TransactionDetail extends Model
     public function getLaundryStatusAttribute(): string
     {
         if ($this->is_collected) return 'collected';
+        if ($this->manually_completed_at) return 'completed';
         // Preserve compatibility for old rows without a known line deadline.
         if (!$this->timing_configured) return $this->transaction->laundry_status ?? 'received';
         if ($this->late_at && now()->gt($this->late_at)) return 'late';

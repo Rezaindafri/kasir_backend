@@ -16,6 +16,10 @@ class AuditLogService
         string $action,
         array $metadata = [],
     ): void {
+        if ($actor) {
+            $metadata['actor_snapshot'] = $actor->only(['id', 'name', 'username', 'role']);
+        }
+
         AuditLog::query()->create([
             'owner_id' => $ownerId,
             'actor_id' => $actor?->id,

@@ -150,7 +150,7 @@ class OwnerScopeAndSuperOwnerTest extends TestCase
             ->assertJsonPath('message', 'Username atau password owner tidak sesuai.');
     }
 
-    public function test_only_owner_can_delete_uncollected_transactions_and_changes_are_audited(): void
+    public function test_cashier_deletion_requires_a_reason_and_recent_transaction_and_is_audited(): void
     {
         $owner = $this->owner('transaction');
         $cashier = $this->cashier($owner, 'transaction');
@@ -183,18 +183,34 @@ class OwnerScopeAndSuperOwnerTest extends TestCase
         Sanctum::actingAs($cashier, ['*']);
         $this->putJson('/api/transactions/' . $active->id, ['order_status' => 'completed'])
             ->assertForbidden();
-        $this->deleteJson('/api/transactions/' . $active->id)->assertForbidden();
+        $this->deleteJson('/api/transactions/' . $active->id)->assertUnprocessable()
+            ->assertJsonValidationErrors('reason');
+        $this->deleteJson('/api/transactions/' . $active->id, ['reason' => '   '])->assertUnprocessable();
+        $reason = ['reason' => 'Pesanan tercatat dua kali'];
+        $this->deleteJson('/api/transactions/' . $active->id, $reason)->assertOk();
+        $this->getJson('/api/audit-logs?cashier_activity=1')->assertForbidden();
+
+        $old = $active->replicate();
+        $old->invoice_number = 'INV-OLD';
+        $old->created_at = now()->subHours(3)->subSecond();
+        $old->save();
+        $this->deleteJson('/api/transactions/' . $old->id, $reason)->assertForbidden();
 
         Sanctum::actingAs($owner, ['*']);
         $this->deleteJson('/api/transactions/' . $collected->id)
             ->assertUnprocessable()
             ->assertJsonPath('message', 'Transaksi yang sudah diambil tidak dapat dihapus');
-        $this->deleteJson('/api/transactions/' . $active->id)->assertOk();
+        $this->deleteJson('/api/transactions/' . $old->id)->assertOk();
+        $this->getJson('/api/audit-logs?cashier_activity=1&action=transaction.deleted')
+            ->assertOk()
+            ->assertJsonPath('meta.total', 1)
+            ->assertJsonPath('data.0.metadata.reason', $reason['reason'])
+            ->assertJsonPath('data.0.metadata.actor_snapshot.id', $cashier->id);
 
         $this->assertDatabaseMissing('transactions', ['id' => $active->id]);
         $this->assertDatabaseHas('audit_logs', [
             'owner_id' => $owner->id,
-            'actor_id' => $owner->id,
+            'actor_id' => $cashier->id,
             'subject_type' => 'transaction',
             'subject_id' => $active->id,
             'action' => 'transaction.deleted',

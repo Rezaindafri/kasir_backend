@@ -45,6 +45,7 @@ class TransactionController extends Controller
             'to' => ['nullable', 'date'],
             'collected' => ['nullable', 'boolean'],
             'active_processing' => ['nullable', 'boolean'],
+            'pending_service_completion' => ['nullable', 'boolean'],
             'ready_for_collection' => ['nullable', 'boolean'],
             'cashier_id' => ['nullable', 'integer'],
             'sort' => ['nullable', 'in:created_at,estimated_finish_at'],
@@ -92,6 +93,9 @@ class TransactionController extends Controller
         // status and an estimated completion time that has not passed.
         if (!empty($validated['active_processing'])) {
             $query->activelyProcessing();
+        }
+        if (!empty($validated['pending_service_completion'])) {
+            $query->pendingServiceCompletion();
         }
         if (!empty($validated['ready_for_collection'])) {
             $query->readyForCollection();
@@ -428,6 +432,55 @@ class TransactionController extends Controller
             'message' => 'Status laundry berhasil diperbarui',
             'data' => $transaction->fresh()->load(['customer', 'transactionDetails.service']),
         ], 200);
+    }
+
+    public function completeService(Request $request, string $id)
+    {
+        $validated = $request->validate(['detail_id' => 'required|integer|min:1']);
+
+        try {
+            $transaction = DB::transaction(function () use ($request, $id, $validated): Transaction {
+                $transaction = $this->lockedTransaction($request, $id);
+                $this->assertNotCollected($transaction);
+                $line = $transaction->transactionDetails()->findOrFail($validated['detail_id']);
+                $line->setRelation('transaction', $transaction);
+
+                // Retrying a successful request must not create a second audit entry.
+                if ($line->is_ready && !$line->is_collected) return $transaction;
+
+                if ($line->is_collected) {
+                    throw ValidationException::withMessages([
+                        'detail_id' => 'Layanan yang sudah diambil tidak dapat diselesaikan kembali.',
+                    ]);
+                }
+
+                $before = $this->auditSnapshot($transaction);
+                $line->update(['manually_completed_at' => now()]);
+                $this->statusService->synchronizeTransaction($transaction, recordAudit: false);
+                $this->auditLog->record(
+                    $request->user(),
+                    $transaction->owner_id,
+                    'transaction',
+                    $transaction->id,
+                    'transaction.service_completed_manually',
+                    [
+                        'before' => $before,
+                        'after' => $this->auditSnapshot($transaction),
+                        'detail_id' => $line->id,
+                        'service_name' => $line->service_name ?: $line->service?->name,
+                    ],
+                );
+
+                return $transaction;
+            });
+        } catch (\Throwable $e) {
+            return $this->apiFailure($e, 'Gagal menyelesaikan layanan. Coba lagi nanti.');
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $transaction->load(['customer', 'transactionDetails.service']),
+        ]);
     }
 
     public function markPayment(Request $request, string $id)
@@ -798,6 +851,15 @@ class TransactionController extends Controller
             ], 404);
         }
 
+        $isCashier = $request->user()->role === 'kasir';
+        $validated = $request->validate([
+            'reason' => [$isCashier ? 'required' : 'nullable', 'string', 'max:500'],
+        ]);
+        $reason = trim($validated['reason'] ?? '');
+        if ($isCashier && $reason === '') {
+            throw ValidationException::withMessages(['reason' => 'Alasan hapus wajib diisi.']);
+        }
+
         if ($transaction->laundry_status === 'collected') {
             return response()->json([
                 'status' => 'error',
@@ -813,9 +875,12 @@ class TransactionController extends Controller
         }
 
         try {
-            DB::transaction(function () use ($transaction, $request, $id): void {
+            DB::transaction(function () use ($request, $id, $isCashier, $reason): void {
                 $transaction = $this->lockedTransaction($request, $id);
                 $this->assertNotCollected($transaction);
+                if ($isCashier && now()->gt($transaction->created_at->copy()->addHours(3))) {
+                    abort(403, 'Transaksi berusia lebih dari 3 jam hanya dapat dihapus oleh owner.');
+                }
                 if ((float) ($transaction->paid_amount ?? 0) > 0 || $transaction->payments()->exists() ||
                     $transaction->transactionDetails()->where('is_collected', true)->exists()) {
                     throw ValidationException::withMessages([
@@ -831,7 +896,7 @@ class TransactionController extends Controller
                     'transaction',
                     (int) $id,
                     'transaction.deleted',
-                    ['before' => $snapshot],
+                    ['before' => $snapshot, 'reason' => $reason === '' ? null : $reason],
                 );
             });
         } catch (\Throwable $e) {
@@ -916,7 +981,7 @@ class TransactionController extends Controller
             'estimated_finish_at',
         ]), 'details' => $transaction->transactionDetails()->get()->map(fn ($line) => $line->only([
             'id', 'service_id', 'service_name', 'service_unit', 'qty', 'price', 'express_fee',
-            'subtotal', 'estimated_finish_at', 'is_collected', 'collected_at', 'collected_by',
+            'subtotal', 'estimated_finish_at', 'manually_completed_at', 'is_collected', 'collected_at', 'collected_by',
         ]))->all()];
     }
 }

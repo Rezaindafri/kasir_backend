@@ -68,6 +68,79 @@ class MultiServicePaymentAndCollectionTest extends TestCase
         $this->travelBack();
     }
 
+    public function test_cashier_can_finish_one_service_early_without_changing_estimate_or_payment(): void
+    {
+        $this->travelTo(Carbon::parse('2026-11-20 07:00:00', 'UTC'));
+        $owner = $this->account();
+        $cashier = $this->account('kasir', $owner->id);
+        $outsider = $this->account('kasir', $this->account()->id);
+        Sanctum::actingAs($cashier);
+        $order = $this->order($owner);
+        [$first, $second] = $order->transactionDetails()->orderBy('id')->get()->all();
+        $url = '/api/transactions/' . $order->id . '/complete-service';
+
+        Sanctum::actingAs($outsider);
+        $this->postJson($url, ['detail_id' => $first->id])->assertNotFound();
+
+        Sanctum::actingAs($cashier);
+        $this->getJson('/api/transactions?pending_service_completion=1')->assertOk()
+            ->assertJsonPath('meta.total', 1)
+            ->assertJsonPath('data.0.id', $order->id);
+        $this->postJson($url, ['detail_id' => $first->id])->assertOk()
+            ->assertJsonPath('data.transaction_details.0.is_ready', true)
+            ->assertJsonPath('data.transaction_details.1.is_ready', false);
+        $this->postJson($url, ['detail_id' => $first->id])->assertOk();
+
+        $this->assertTrue($first->estimated_finish_at->eq($first->fresh()->estimated_finish_at));
+        $this->assertSame(0, (int) $order->fresh()->paid_amount);
+        $this->assertFalse($first->fresh()->is_collected);
+        $this->getJson('/api/transactions?ready_for_collection=1')->assertOk()
+            ->assertJsonPath('meta.total', 1);
+        $this->getJson('/api/transactions?active_processing=1')->assertOk()
+            ->assertJsonPath('meta.total', 1);
+
+        Sanctum::actingAs($owner);
+        $this->getJson('/api/audit-logs?cashier_activity=1&action=transaction.service_completed_manually')
+            ->assertOk()
+            ->assertJsonPath('meta.total', 1)
+            ->assertJsonPath('data.0.metadata.actor_snapshot.id', $cashier->id)
+            ->assertJsonPath('data.0.metadata.service_name', $first->service_name)
+            ->assertJsonPath('data.0.metadata.detail_id', $first->id);
+        $this->postJson($url, ['detail_id' => $second->id])->assertOk()
+            ->assertJsonPath('data.laundry_status', 'completed');
+        $this->getJson('/api/transactions?active_processing=1')->assertOk()
+            ->assertJsonPath('meta.total', 0);
+        $this->getJson('/api/transactions?pending_service_completion=1')->assertOk()
+            ->assertJsonPath('meta.total', 0);
+        $this->travel(12)->hours();
+        $this->getJson('/api/transactions/' . $order->id)->assertOk()
+            ->assertJsonPath('data.laundry_status', 'completed');
+        $this->travelBack();
+    }
+
+    public function test_pending_completion_includes_legacy_services_without_a_deadline(): void
+    {
+        $owner = $this->account();
+        $cashier = $this->account('kasir', $owner->id);
+        Sanctum::actingAs($cashier);
+        $order = $this->order($owner);
+        $order->update(['estimated_finish_at' => null]);
+        $order->transactionDetails()->update([
+            'timing_configured' => false,
+            'estimated_finish_at' => null,
+        ]);
+        $this->getJson('/api/transactions?active_processing=1')->assertOk()
+            ->assertJsonPath('meta.total', 0);
+        $this->getJson('/api/transactions?pending_service_completion=1')->assertOk()
+            ->assertJsonPath('meta.total', 1);
+        $line = $order->transactionDetails()->firstOrFail();
+        $this->postJson('/api/transactions/' . $order->id . '/complete-service', [
+            'detail_id' => $line->id,
+        ])->assertOk()
+            ->assertJsonPath('data.transaction_details.0.is_ready', true)
+            ->assertJsonPath('data.transaction_details.1.is_ready', false);
+    }
+
     public function test_partial_handover_applies_existing_dp_and_keeps_remaining_services_open(): void
     {
         $this->travelTo(Carbon::parse('2026-10-10 07:00:00', 'UTC'));

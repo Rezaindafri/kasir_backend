@@ -15,7 +15,7 @@ class Transaction extends Model
     {
         if ($this->laundry_status === 'collected') return false;
         $lines = $this->transactionDetails;
-        if ($lines->contains(fn ($line) => $line->timing_configured)) {
+        if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
             return $lines->contains(fn ($line) => !$line->is_collected && $line->is_ready);
         }
         return in_array($this->laundry_status, ['completed', 'late'], true);
@@ -25,7 +25,7 @@ class Transaction extends Model
     {
         if ($this->laundry_status === 'collected') return false;
         $lines = $this->transactionDetails;
-        if ($lines->contains(fn ($line) => $line->timing_configured)) {
+        if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
             return $lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready);
         }
         return in_array($this->laundry_status, ['received', 'washing', 'drying', 'ironing'], true)
@@ -36,8 +36,8 @@ class Transaction extends Model
     {
         if (!$this->is_processing) return false;
         $lines = $this->transactionDetails;
-        if ($lines->contains(fn ($line) => $line->timing_configured)) {
-            return $lines->contains(fn ($line) => !$line->is_collected && $line->estimated_finish_at
+        if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
+            return $lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready && $line->estimated_finish_at
                 && $line->estimated_finish_at->gt(now()) && $line->estimated_finish_at->lte(now()->addHours(24)));
         }
         return $this->estimated_finish_at && $this->estimated_finish_at->lte(now()->addHours(24));
@@ -54,10 +54,14 @@ class Transaction extends Model
     {
         return $query->where('laundry_status', '!=', 'collected')->where(function ($query) {
             $query->whereHas('transactionDetails', fn ($line) => $line
-                ->where('timing_configured', true)->where('is_collected', false)
-                ->where(fn ($date) => $date->whereNull('estimated_finish_at')->orWhere('estimated_finish_at', '<=', now())))
+                ->where('is_collected', false)
+                ->where(fn ($ready) => $ready->whereNotNull('manually_completed_at')
+                    ->orWhere(fn ($timed) => $timed->where('timing_configured', true)
+                        ->where(fn ($date) => $date->whereNull('estimated_finish_at')
+                            ->orWhere('estimated_finish_at', '<=', now())))))
                 ->orWhere(fn ($legacy) => $legacy
-                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true))
+                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true)
+                        ->orWhereNotNull('manually_completed_at'))
                     ->whereIn('laundry_status', ['completed', 'late']));
         });
     }
@@ -66,12 +70,31 @@ class Transaction extends Model
     {
         return $query->where('laundry_status', '!=', 'collected')->where(function ($query) {
             $query->whereHas('transactionDetails', fn ($line) => $line
-                ->where('timing_configured', true)->where('is_collected', false)->where('estimated_finish_at', '>', now()))
+                ->where('timing_configured', true)->where('is_collected', false)
+                ->whereNull('manually_completed_at')->where('estimated_finish_at', '>', now()))
                 ->orWhere(fn ($legacy) => $legacy
-                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true))
+                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true)
+                        ->orWhereNotNull('manually_completed_at'))
                     ->whereIn('laundry_status', ['received', 'washing', 'drying', 'ironing'])
                     ->where('estimated_finish_at', '>', now()));
         });
+    }
+
+    public function scopePendingServiceCompletion($query)
+    {
+        $now = now();
+
+        return $query->where('laundry_status', '!=', 'collected')
+            ->whereHas('transactionDetails', fn ($line) => $line
+                ->where('is_collected', false)
+                ->whereNull('manually_completed_at')
+                ->where(fn ($pending) => $pending
+                    ->where(fn ($timed) => $timed->where('timing_configured', true)
+                        ->where('estimated_finish_at', '>', $now)
+                        ->where(fn ($late) => $late->whereNull('late_at')
+                            ->orWhere('late_at', '>=', $now)))
+                    ->orWhere(fn ($legacy) => $legacy->where('timing_configured', false)
+                        ->whereIn('transactions.laundry_status', ['received', 'washing', 'drying', 'ironing']))));
     }
 
     protected $fillable = [
