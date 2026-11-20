@@ -45,7 +45,7 @@ class TransactionDetail extends Model
         if ($this->is_collected) return 'collected';
         if ($this->manually_completed_at) return 'completed';
         // Preserve compatibility for old rows without a known line deadline.
-        if (!$this->timing_configured) return $this->transaction->laundry_status ?? 'received';
+        if (!$this->timing_configured) return $this->transaction?->legacyLaundryStatus() ?? 'received';
         if ($this->late_at && now()->gt($this->late_at)) return 'late';
         if (!$this->estimated_finish_at || now()->gte($this->estimated_finish_at)) return 'completed';
         return 'received';

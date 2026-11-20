@@ -141,6 +141,84 @@ class MultiServicePaymentAndCollectionTest extends TestCase
             ->assertJsonPath('data.transaction_details.1.is_ready', false);
     }
 
+    public function test_legacy_partial_manual_completion_keeps_processing_and_automatic_deadlines_consistent(): void
+    {
+        $this->travelTo(Carbon::parse('2026-11-20 07:00:00', 'UTC'));
+        try {
+            $owner = $this->account();
+            $cashier = $this->account('kasir', $owner->id);
+            Sanctum::actingAs($cashier);
+            $order = $this->order($owner);
+            $finish = $order->estimated_finish_at->copy();
+            $order->transactionDetails()->update([
+                'timing_configured' => false, 'estimated_finish_at' => null, 'late_at' => null,
+            ]);
+            $first = $order->transactionDetails()->firstOrFail();
+            $url = '/api/transactions/' . $order->id;
+            $this->postJson($url . '/complete-service', ['detail_id' => $first->id])->assertOk()
+                ->assertJsonPath('data.transaction_details.0.is_ready', true)
+                ->assertJsonPath('data.transaction_details.1.is_ready', false);
+            $this->assertTrue($order->fresh()->is_processing);
+            $this->assertSame(1, Transaction::activelyProcessing()->count());
+            $this->getJson('/api/transactions?active_processing=1')->assertOk()->assertJsonPath('meta.total', 1);
+            $this->getJson('/api/dashboard/kasir')->assertOk()->assertJsonPath('data.summary.in_progress', 1);
+            Sanctum::actingAs($owner);
+            $this->getJson('/api/dashboard/owner')->assertOk()->assertJsonPath('data.summary.processing', 1);
+
+            $this->travelTo($finish);
+            $this->getJson($url)->assertOk()
+                ->assertJsonPath('data.laundry_status', 'completed')
+                ->assertJsonPath('data.transaction_details.1.is_ready', true);
+            $this->assertFalse($order->fresh()->is_processing);
+            $this->assertSame(0, Transaction::activelyProcessing()->count());
+            $this->assertSame(0, Transaction::pendingServiceCompletion()->count());
+            $this->assertSame(1, Transaction::readyForCollection()->count());
+
+            $duration = $finish->diffInSeconds($order->created_at, true);
+            $this->travelTo($finish->copy()->addSeconds($duration));
+            $this->getJson($url)->assertOk()->assertJsonPath('data.laundry_status', 'completed');
+            $this->travel(1)->seconds();
+            $this->getJson($url)->assertOk()
+                ->assertJsonPath('data.laundry_status', 'late')
+                ->assertJsonPath('data.transaction_details.0.laundry_status', 'completed')
+                ->assertJsonPath('data.transaction_details.1.laundry_status', 'late');
+            $this->assertTrue($finish->eq($order->fresh()->estimated_finish_at));
+            $this->assertSame(0, (int) $order->fresh()->paid_amount);
+            $this->assertSame(0, $order->payments()->count());
+            $this->assertSame(0, $order->transactionDetails()->where('is_collected', true)->count());
+            $this->assertSame(1, AuditLog::where('action', 'transaction.service_completed_manually')->count());
+        } finally {
+            $this->travelBack();
+        }
+    }
+
+    public function test_all_legacy_lines_manually_completed_stay_ready_without_payment_or_collection(): void
+    {
+        $this->travelTo(Carbon::parse('2026-11-20 07:00:00', 'UTC'));
+        try {
+            $owner = $this->account();
+            Sanctum::actingAs($owner);
+            $order = $this->order($owner);
+            $order->transactionDetails()->update([
+                'timing_configured' => false, 'estimated_finish_at' => null, 'late_at' => null,
+            ]);
+            foreach ($order->transactionDetails()->get() as $line) {
+                $this->postJson('/api/transactions/' . $order->id . '/complete-service', [
+                    'detail_id' => $line->id,
+                ])->assertOk();
+            }
+            $this->travel(12)->hours();
+            $this->getJson('/api/transactions/' . $order->id)->assertOk()
+                ->assertJsonPath('data.laundry_status', 'completed');
+            $this->assertSame(0, Transaction::activelyProcessing()->count());
+            $this->assertSame(0, Transaction::pendingServiceCompletion()->count());
+            $this->assertSame(1, Transaction::readyForCollection()->count());
+            $this->assertSame(0, (int) $order->fresh()->paid_amount);
+        } finally {
+            $this->travelBack();
+        }
+    }
+
     public function test_partial_handover_applies_existing_dp_and_keeps_remaining_services_open(): void
     {
         $this->travelTo(Carbon::parse('2026-10-10 07:00:00', 'UTC'));

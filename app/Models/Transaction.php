@@ -4,12 +4,26 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Carbon;
 
 class Transaction extends Model
 {
     use HasFactory;
 
     protected $appends = ['has_proof_image', 'has_ready_items', 'is_processing'];
+
+    // Old detail rows inherit their invoice deadline, not its aggregate status
+    // once another line is completed manually. This avoids circular readiness.
+    public function legacyLaundryStatus(): string
+    {
+        if (in_array($this->laundry_status, ['collected', 'late'], true) ||
+            !$this->estimated_finish_at || now()->lt($this->estimated_finish_at)) {
+            return $this->laundry_status ?? 'received';
+        }
+        $finish = Carbon::parse($this->estimated_finish_at);
+        $duration = max(0, $finish->diffInSeconds(Carbon::parse($this->created_at), true));
+        return now()->gt($finish->copy()->addSeconds($duration)) ? 'late' : 'completed';
+    }
 
     public function getHasReadyItemsAttribute(): bool
     {
@@ -18,17 +32,18 @@ class Transaction extends Model
         if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
             return $lines->contains(fn ($line) => !$line->is_collected && $line->is_ready);
         }
-        return in_array($this->laundry_status, ['completed', 'late'], true);
+        return in_array($this->legacyLaundryStatus(), ['completed', 'late'], true);
     }
 
     public function getIsProcessingAttribute(): bool
     {
         if ($this->laundry_status === 'collected') return false;
         $lines = $this->transactionDetails;
-        if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
-            return $lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready);
+        if ($lines->isNotEmpty()) {
+            return $lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready &&
+                ($line->timing_configured ? $line->estimated_finish_at : $this->estimated_finish_at)?->gt(now()));
         }
-        return in_array($this->laundry_status, ['received', 'washing', 'drying', 'ironing'], true)
+        return in_array($this->legacyLaundryStatus(), ['received', 'washing', 'drying', 'ironing'], true)
             && $this->estimated_finish_at && $this->estimated_finish_at->gt(now());
     }
 
@@ -36,9 +51,12 @@ class Transaction extends Model
     {
         if (!$this->is_processing) return false;
         $lines = $this->transactionDetails;
-        if ($lines->contains(fn ($line) => $line->timing_configured || $line->manually_completed_at)) {
-            return $lines->contains(fn ($line) => !$line->is_collected && !$line->is_ready && $line->estimated_finish_at
-                && $line->estimated_finish_at->gt(now()) && $line->estimated_finish_at->lte(now()->addHours(24)));
+        if ($lines->isNotEmpty()) {
+            return $lines->contains(function ($line): bool {
+                $finish = $line->timing_configured ? $line->estimated_finish_at : $this->estimated_finish_at;
+                return !$line->is_collected && !$line->is_ready && $finish &&
+                    $finish->gt(now()) && $finish->lte(now()->addHours(24));
+            });
         }
         return $this->estimated_finish_at && $this->estimated_finish_at->lte(now()->addHours(24));
     }
@@ -52,31 +70,38 @@ class Transaction extends Model
     // remain counts of distinct invoices, never joins that duplicate money.
     public function scopeReadyForCollection($query)
     {
-        return $query->where('laundry_status', '!=', 'collected')->where(function ($query) {
+        $now = now();
+        $legacyReady = fn ($parent) => $parent->whereIn('transactions.laundry_status', ['completed', 'late'])
+            ->orWhere('transactions.estimated_finish_at', '<=', $now);
+        return $query->where('laundry_status', '!=', 'collected')->where(function ($query) use ($now, $legacyReady) {
             $query->whereHas('transactionDetails', fn ($line) => $line
                 ->where('is_collected', false)
                 ->where(fn ($ready) => $ready->whereNotNull('manually_completed_at')
                     ->orWhere(fn ($timed) => $timed->where('timing_configured', true)
                         ->where(fn ($date) => $date->whereNull('estimated_finish_at')
-                            ->orWhere('estimated_finish_at', '<=', now())))))
+                            ->orWhere('estimated_finish_at', '<=', $now)->orWhere('late_at', '<', $now)))
+                    ->orWhere(fn ($legacy) => $legacy->where('timing_configured', false)->where($legacyReady))))
                 ->orWhere(fn ($legacy) => $legacy
-                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true)
-                        ->orWhereNotNull('manually_completed_at'))
-                    ->whereIn('laundry_status', ['completed', 'late']));
+                    ->doesntHave('transactionDetails')->where($legacyReady));
         });
     }
 
     public function scopeActivelyProcessing($query)
     {
-        return $query->where('laundry_status', '!=', 'collected')->where(function ($query) {
+        $now = now();
+        $legacyProcessing = fn ($parent) => $parent
+            ->whereIn('transactions.laundry_status', ['received', 'washing', 'drying', 'ironing'])
+            ->where('transactions.estimated_finish_at', '>', $now);
+        return $query->where('laundry_status', '!=', 'collected')->where(function ($query) use ($now, $legacyProcessing) {
             $query->whereHas('transactionDetails', fn ($line) => $line
-                ->where('timing_configured', true)->where('is_collected', false)
-                ->whereNull('manually_completed_at')->where('estimated_finish_at', '>', now()))
+                ->where('is_collected', false)->whereNull('manually_completed_at')
+                ->where(fn ($pending) => $pending
+                    ->where(fn ($timed) => $timed->where('timing_configured', true)
+                        ->where('estimated_finish_at', '>', $now)
+                        ->where(fn ($late) => $late->whereNull('late_at')->orWhere('late_at', '>=', $now)))
+                    ->orWhere(fn ($legacy) => $legacy->where('timing_configured', false)->where($legacyProcessing))))
                 ->orWhere(fn ($legacy) => $legacy
-                    ->whereDoesntHave('transactionDetails', fn ($line) => $line->where('timing_configured', true)
-                        ->orWhereNotNull('manually_completed_at'))
-                    ->whereIn('laundry_status', ['received', 'washing', 'drying', 'ironing'])
-                    ->where('estimated_finish_at', '>', now()));
+                    ->doesntHave('transactionDetails')->where($legacyProcessing));
         });
     }
 
@@ -94,7 +119,9 @@ class Transaction extends Model
                         ->where(fn ($late) => $late->whereNull('late_at')
                             ->orWhere('late_at', '>=', $now)))
                     ->orWhere(fn ($legacy) => $legacy->where('timing_configured', false)
-                        ->whereIn('transactions.laundry_status', ['received', 'washing', 'drying', 'ironing']))));
+                        ->whereIn('transactions.laundry_status', ['received', 'washing', 'drying', 'ironing'])
+                        ->where(fn ($date) => $date->whereNull('transactions.estimated_finish_at')
+                            ->orWhere('transactions.estimated_finish_at', '>', $now)))));
     }
 
     protected $fillable = [

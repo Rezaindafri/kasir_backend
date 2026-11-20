@@ -3,7 +3,6 @@
 namespace App\Services;
 
 use App\Models\Transaction;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
 class TransactionStatusService
@@ -50,13 +49,7 @@ class TransactionStatusService
             } else {
                 // Legacy transactions without line timing retain the old
                 // deadline/status contract, including unknown/null estimates.
-                if ($current->laundry_status === 'late' || !$current->estimated_finish_at || now()->lt($current->estimated_finish_at)) {
-                    $transaction->setRawAttributes($current->getAttributes(), true);
-                    return;
-                }
-                $finish = Carbon::parse($current->estimated_finish_at);
-                $seconds = max(0, $finish->diffInSeconds(Carbon::parse($current->created_at), true));
-                $status = now()->gt($finish->copy()->addSeconds($seconds)) ? 'late' : 'completed';
+                $status = $current->legacyLaundryStatus();
             }
 
             if ($current->laundry_status !== $status) {
